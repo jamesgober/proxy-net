@@ -3,7 +3,7 @@
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
 > Design and decisions: [`PLAN.md`](./PLAN.md).
 >
-> **Scheduled later** in the stack build order (`_strategy/WEB-STACK-DELIVERABLES.md`). Work starts when its trigger in PLAN.md is reached.
+> **Scheduled later** in the stack build order. Work starts when its trigger in PLAN.md is reached.
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 

@@ -2,7 +2,7 @@
 
 > The design, strategy, and decision record for `proxy-net`. A living document: every design decision, idea, or open question about proxy-net is written here or in [`ROADMAP.md`](./ROADMAP.md) before it is acted on.
 >
-> **Status:** scaffold, `0.1.0`. **Scheduled later** (see `_strategy/WEB-STACK-DELIVERABLES.md`).
+> **Status:** scaffold, `0.1.0`. **Scheduled later**.
 
 ---
 
