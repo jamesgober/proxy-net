@@ -82,11 +82,11 @@ fn test_a_chain_of_two_proxies_adds_each_hop_once() {
     let r = get(edge);
     // On the way back each proxy adds its Via too, nearest first.
     let lower = r.to_ascii_lowercase();
-    assert!(lower.find("via: 1.1 inner") < lower.find("via: 1.1 edge"), "{r}");
     assert!(
-        r.starts_with("HTTP/1.1 200") && r.contains("origin"),
+        lower.find("via: 1.1 inner") < lower.find("via: 1.1 edge"),
         "{r}"
     );
+    assert!(r.starts_with("HTTP/1.1 200") && r.contains("origin"), "{r}");
     let heads = heads.lock().expect("lock").clone();
     assert_eq!(heads.len(), 1);
     let h = heads[0].to_ascii_lowercase();
