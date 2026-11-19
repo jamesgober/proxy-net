@@ -464,8 +464,12 @@ pub fn check(data: &[u8]) -> Result<bool, String> {
     if ours.method != method {
         return Err(format!("method {method} became {}", ours.method));
     }
+    // The forwarding fields are the proxy's own: the client's values for
+    // them (the "evil" host above) never reach the upstream. A field of the
+    // input's own making may say anything.
     for (n, v) in &ours.fields {
-        if v.windows(4).any(|w| w.eq_ignore_ascii_case(b"evil")) && n != "cookie" {
+        let forwarding = proxy_net::FORWARDING_SET.contains(&n.as_str());
+        if forwarding && v.windows(4).any(|w| w.eq_ignore_ascii_case(b"evil")) {
             return Err(format!(
                 "{n}: a client's forwarding value reached the upstream"
             ));
