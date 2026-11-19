@@ -13,6 +13,67 @@
 
 ---
 
+## [0.5.0] - 2026-11-19
+
+Feature complete: every feature planned for 1.0 is in.
+
+### Added
+
+- Live changes on `ProxyHandle`: `reload` replaces the whole configuration,
+  `set_endpoints` replaces one pool's endpoints, and `drain_endpoint` takes
+  an endpoint out of rotation while its exchanges finish. Endpoints present
+  before and after keep their health, pooled connections, and slow-start
+  ramp; a request whose head arrived before a change is routed again under
+  the new configuration.
+- Discovery: the `Discovery` trait, `StaticDiscovery`, `DnsDiscovery`,
+  `Pool::discovery`, and `Pool::discovery_allow` with `Cidr` ranges. Without
+  an allowlist, discovered loopback, link-local, unspecified, multicast, and
+  broadcast addresses are refused. A failed or empty refresh keeps the last
+  set and is reported.
+- TLS to upstreams (feature `tls`): `UpstreamTls` (public or private roots,
+  a server name, a client certificate), `Pool::tls`, and
+  `client::TlsConnector` through tls-net.
+- The PROXY protocol to upstreams: `ProxyProtocol` (v1, v2 with the
+  authority and CRC32C TLVs) and `Pool::proxy_protocol`. Health checks send
+  `LOCAL` or `UNKNOWN`; connections that carry a header are not reused.
+- The WebSocket bridge (feature `ws`): on routes with `websocket(true)`,
+  serve-net terminates the client's WebSocket and ws-net opens one to the
+  upstream; messages are parsed and written again both ways, and the client
+  gets its 101 only after the upstream's genuine 101.
+- `Pool::slow_start(ramp)`: an endpoint that comes back from ejection, or
+  that a live change adds, takes a growing share of its turns.
+- `ProxyBuilder::request_id(name)`: a client's id is kept when it is a token
+  of 1 to 64 bytes, and replaced with 32 hex characters otherwise.
+- Append mode (`Forwarded::append_trusted`) is applied: the entries trusted
+  proxies added are kept, and the socket peer is added.
+- `Observer::response_outlier` (a response far larger than the route's
+  usual) and `Observer::discovery_failed`.
+- `EndpointHealth::ramp`, `Config::request_id`, `PoolConfig::{proxy_protocol,
+  tls, slow_start, discovery_allow}`.
+- `docs/ARCHITECTURE.md`.
+- Tests: live changes, discovery and its allowlist, the PROXY protocol,
+  request ids, slow start across reloads, the WebSocket bridge (messages
+  both ways, a subprotocol, and fake upgrades answered 502), TLS settings
+  and a plain upstream behind a TLS pool; a fuzz target for append mode and
+  request ids.
+
+### Changed
+
+- `ProxyHandle::balancer` is replaced by `ProxyHandle::is_eligible`, and
+  `Proxy::config` returns an owned `Config`: the running state can now be
+  swapped, so a reference into it cannot be handed out.
+- `Pool::slow_start` replaces the planned `Endpoint::slow_start`.
+- An address range with bits set past its prefix (`10.1.0.0/8`) is refused.
+
+### Known gaps
+
+- A pool with TLS is not bridged for WebSocket yet (502); see the roadmap.
+- serve-net cannot close a client's WebSocket from outside a callback, so an
+  upstream close reaches the client at its next message or at the tunnel
+  idle timeout.
+
+---
+
 ## [0.4.0] - 2026-11-19
 
 Forwarding over real sockets.
@@ -150,7 +211,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/proxy-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/proxy-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/proxy-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/proxy-net/compare/v0.1.0...v0.2.0

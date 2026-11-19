@@ -97,7 +97,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          [endpoint, route_pattern, route_match, path_check, request_fields, exchange, upstream_response]
+          [endpoint, route_pattern, route_match, path_check, request_fields, exchange, upstream_response, forwarded_append]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master

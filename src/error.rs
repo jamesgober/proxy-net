@@ -39,6 +39,12 @@ impl ConfigError {
     pub fn reason(&self) -> &ConfigReason {
         &self.reason
     }
+
+    /// The same error, placed at `item`.
+    pub(crate) fn at(mut self, item: ConfigItem) -> ConfigError {
+        self.item = item;
+        self
+    }
 }
 
 impl fmt::Display for ConfigError {

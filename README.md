@@ -51,17 +51,21 @@
 - **Endpoints** - by address or host name, with weights, priority tiers for failover, and connection caps.
 - **Policies** - smooth weighted round robin, least connections, power of two choices, Maglev consistent hashing with a load bound, random, and first healthy.
 - **Health** - active checks (HTTP or TCP, with jitter, rise and fall counts) and passive outlier detection with a panic threshold.
+- **Slow start** - an endpoint that comes back, or that a live change adds, takes a growing share of traffic.
 
 ### **Forwarding**
 - **Re-serialized** - requests and responses parsed strictly and written again.
 - **Streamed** - bodies relayed with bounded buffers and backpressure both ways.
 - **Retries** - only for idempotent requests whose body is held in full, before any response byte reached the client, under a retry budget.
+- **Upstream protocols** - TLS with verified certificates and client certificates, the PROXY protocol (v1 and v2), and WebSocket bridged message by message.
+- **Live changes** - reload the whole configuration, replace a pool's endpoints, or drain one endpoint, without dropping a request; discovery (static or DNS) behind an address allowlist.
 
 ### **Safe defaults**
 - **Forwarding headers rebuilt** - `Forwarded`, `X-Forwarded-*`, `X-Real-IP` and similar fields from clients are removed; the proxy writes its own from the real client.
 - **Ambiguous paths refused** - `..`, `%2e`, `%2f`, `\`, and `..;/` forms answer 400 unless a route allows them.
 - **No body on `GET`** - a body on `GET`, `HEAD`, `OPTIONS`, `TRACE`, or `DELETE` is refused unless a route allows it.
 - **Loops detected** - `Via` carries the proxy's pseudonym, and a request that comes back is refused.
+- **WebSocket only after a real handshake** - the client gets its 101 only after the upstream's genuine 101 with the right accept key.
 
 ### **Reliability and safety**
 - **No unsafe code** - `#![forbid(unsafe_code)]`.
@@ -97,14 +101,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-proxy-net = "0.4"
+proxy-net = "0.5"
 ```
 
 Without the standard library (the configuration types and the core only):
 
 ```toml
 [dependencies]
-proxy-net = { version = "0.4", default-features = false }
+proxy-net = { version = "0.5", default-features = false }
 ```
 
 | Feature | Enables | Default |
@@ -112,13 +116,15 @@ proxy-net = { version = "0.4", default-features = false }
 | `serve` | The serve-net service, `Proxy::serve`, and `proxy_net::proxy`. Implies `client`. | yes |
 | `client` | The upstream side over net-io and http-net: connections, the connection pool, the forwarder, the health checker. Implies `std`. | yes |
 | `std` | Integration with the standard library. Without it the crate needs only `alloc` and 64-bit atomics. | yes |
+| `tls` | TLS to upstreams through tls-net (aws-lc-rs underneath). Implies `client`. | no |
+| `ws` | The WebSocket bridge through ws-net. Implies `serve`. | no |
 
 **Feature Recommendations**:
 - **A proxy in front of servers**: the defaults.
 - **Another inbound engine driving the forwarder**: `default-features = false, features = ["client"]`.
+- **Upstreams across a network you do not trust**: add `tls`.
+- **WebSocket applications**: add `ws`, and `Route::websocket(true)` on their routes.
 - **Embedding the core on `no_std`**: `default-features = false`.
-
-TLS and WebSocket (`tls`, `ws`) arrive in 0.5.
 
 ---
 
@@ -212,9 +218,9 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 
 ---
 
-## **Status: Forwarding**
+## **Status: Feature complete**
 
-**Current Version:** `0.4.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in. proxy-net forwards real traffic: the serve-net service, the upstream connection pool, retries within a budget, timeouts, active and passive health, the observer, and `proxy_net::proxy`.
+**Current Version:** `0.5.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in. Every feature planned for 1.0 is in: forwarding, TLS and the PROXY protocol to upstreams, the WebSocket bridge, live reload, draining, discovery, slow start, and request ids. What remains is speed, hardening, and time in service.
 
 **Target:** `1.0.0`, after the roadmap in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
@@ -227,9 +233,13 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 - **Health** - passive ejection with growing back-off and a cap on how much of a pool is ejected, active check results, draining.
 - **Forwarding decisions** - request checks, head rewriting with forwarding headers and `Via`, retries within a budget, and the exchange state machine with every timeout.
 - **Forwarding** - the serve-net service, request bodies held when small and streamed when large, responses streamed with backpressure, pooled upstream connections checked before reuse, the active health checker, an observer, and health and counter snapshots.
+- **Upstream protocols** - TLS, the PROXY protocol, and the WebSocket bridge.
+- **Live changes** - reload, endpoint replacement, draining, discovery with an allowlist, slow start.
+- **Request ids and append mode** - a request id field kept or written, and forwarding chains from trusted proxies kept.
 
 **What's planned**:
-- `0.5.0`: WebSocket, TLS and the PROXY protocol to upstreams, live reload, and service discovery.
+- `0.6.0`: benchmarks against other proxies and the optimisation they point to, the reactor path once serve-net can park a streamed reply, and `wss` upstreams through the bridge.
+- `0.7.0`: long fuzz campaigns, soak tests, and the security guide.
 
 **Performance targets** (to be measured by committed benchmarks before 1.0.0):
 - **Route match** under 50 ns for 32 routes, with no allocation
@@ -310,8 +320,8 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 - **Edition**: 2024
 - **`no_std`**: the configuration types and the core need only `alloc` and 64-bit atomics; CI builds the crate for `aarch64-unknown-none`
 - **API Stability**: pre-1.0. The API is locked from 0.2; changes come with a migration note
-- **Dependencies**: first-party only: `parse-net`, and with the default features `http-net`, `net-io`, and `serve-net`
-- **Feature Flags**: `serve`, `client`, `std` (all default); `tls` and `ws` arrive in 0.5
+- **Dependencies**: first-party only: `parse-net`, and with the default features `http-net`, `net-io`, and `serve-net`; `tls` adds `tls-net` (which uses the audited aws-lc-rs) and `ws` adds `ws-net`
+- **Feature Flags**: `serve`, `client`, `std` (all default); `tls`, `ws`
 
 ### **Development Setup**
 ```bash

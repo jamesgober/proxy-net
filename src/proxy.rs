@@ -1,4 +1,5 @@
-//! The running proxy: `Proxy`, its handle, and the health snapshot.
+//! The running proxy: `Proxy`, its handle, live changes, and the health
+//! snapshot.
 
 use std::boxed::Box;
 use std::sync::Arc;
@@ -6,13 +7,14 @@ use std::thread::JoinHandle;
 use std::vec::Vec;
 
 use crate::client::checker::{self, Stop};
+use crate::client::discovery::allowed;
 use crate::client::forward::{Forward, RequestParts};
-use crate::client::runtime::Runtime;
+use crate::client::runtime::{Runtime, Shared};
 use crate::config::{Config, ProxyBuilder};
-use crate::core::{Balancer, EndpointId, EndpointState};
-use crate::endpoint::EndpointAddr;
+use crate::core::{EndpointId, EndpointState};
+use crate::endpoint::{Endpoint, EndpointAddr};
 use crate::error::ConfigError;
-use crate::observe::ProxyStats;
+use crate::observe::{Counters, Observer, ProxyStats};
 
 /// Why a proxy could not start.
 #[non_exhaustive]
@@ -47,10 +49,37 @@ impl From<ConfigError> for ProxyError {
     }
 }
 
+/// Asks every pool's discovery source for its endpoints and puts them in the
+/// builder; a source that fails or gives nothing inside its allowlist leaves
+/// the pool as it was, and the observer hears about it.
+pub(crate) fn discover(builder: ProxyBuilder, observer: &dyn Observer) -> ProxyBuilder {
+    builder.map_pools(|name, pool| {
+        let Some(slot) = pool.discovery_slot().cloned() else {
+            return pool;
+        };
+        match slot.0.endpoints() {
+            Ok(found) => {
+                let kept = allowed(found, pool.allowlist());
+                if kept.is_empty() {
+                    observer.discovery_failed(name, "no endpoint inside the allowlist");
+                    pool
+                } else {
+                    pool.with_endpoints(&kept)
+                }
+            }
+            Err(e) => {
+                observer.discovery_failed(name, e.message());
+                pool
+            }
+        }
+    })
+}
+
 impl ProxyBuilder {
-    /// Builds the proxy: checks the configuration as
-    /// [`config`](ProxyBuilder::config) does, then starts its running state
-    /// (balancers, health, connection pools, and the health checker thread).
+    /// Builds the proxy: asks discovery sources for their endpoints, checks
+    /// the configuration as [`config`](ProxyBuilder::config) does, then
+    /// starts its running state (balancers, health, connection pools, and
+    /// the health checker thread).
     ///
     /// ```no_run
     /// let proxy = proxy_net::ProxyBuilder::new()
@@ -62,12 +91,23 @@ impl ProxyBuilder {
     ///
     /// # Errors
     ///
-    /// `Config` as `config` does; `Io` when the health checker thread
-    /// cannot start.
+    /// `Config` as `config` does (and for TLS settings that cannot be
+    /// loaded); `Io` when the health checker thread cannot start.
     pub fn build(self) -> Result<Proxy, ProxyError> {
         let (observer, connector) = self.parts();
-        let config = self.config()?;
-        Proxy::start(Runtime::new(config, connector, observer)).map_err(ProxyError::Io)
+        let builder = discover(self, &*observer);
+        let config = builder.clone().config()?;
+        let counters = Arc::new(Counters::default());
+        let rt = Runtime::new(config, connector.as_ref(), observer, counters, None, None)?;
+        let shared = Arc::new(Shared::new(builder, rt));
+        let stop = Arc::new(Stop::default());
+        let checker =
+            checker::spawn(Arc::clone(&shared), Arc::clone(&stop)).map_err(ProxyError::Io)?;
+        Ok(Proxy {
+            shared,
+            stop,
+            checker: Some(checker),
+        })
     }
 }
 
@@ -84,54 +124,47 @@ impl ProxyBuilder {
 /// # Ok::<(), proxy_net::ProxyError>(())
 /// ```
 pub struct Proxy {
-    pub(crate) rt: Arc<Runtime>,
+    pub(crate) shared: Arc<Shared>,
     pub(crate) stop: Arc<Stop>,
     pub(crate) checker: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Proxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Proxy")
-            .field("pools", &self.rt.pools.len())
-            .finish_non_exhaustive()
+        f.debug_struct("Proxy").finish_non_exhaustive()
     }
 }
 
 impl Proxy {
-    pub(crate) fn start(rt: Runtime) -> std::io::Result<Proxy> {
-        let rt = Arc::new(rt);
-        let stop = Arc::new(Stop::default());
-        let checker = checker::spawn(Arc::clone(&rt), Arc::clone(&stop))?;
-        Ok(Proxy {
-            rt,
-            stop,
-            checker: Some(checker),
-        })
-    }
-
-    /// A handle for snapshots and control, cheap to clone.
+    /// A handle for snapshots and live changes, cheap to clone.
     pub fn handle(&self) -> ProxyHandle {
         ProxyHandle {
-            rt: Arc::clone(&self.rt),
+            shared: Arc::clone(&self.shared),
         }
     }
 
-    /// The configuration.
-    pub fn config(&self) -> &Config {
-        &self.rt.config
+    /// The current configuration.
+    pub fn config(&self) -> Config {
+        self.shared.runtime().config.clone()
     }
 
-    /// Starts forwarding one request that matched route `route`: the
-    /// transport-neutral entry the serve-net service uses, for other inbound
-    /// engines. `None` when the route does not exist.
+    /// Starts forwarding one request that matched route `route` of the
+    /// current configuration: the transport-neutral entry the serve-net
+    /// service uses, for other inbound engines. `None` when the route does
+    /// not exist.
     pub fn forward(&self, route: usize, parts: RequestParts) -> Option<Forward> {
-        let pool = self.rt.config.routes().get(route)?.pool_index();
-        Some(Forward::new(Arc::clone(&self.rt), route, pool, parts))
+        let rt = self.shared.runtime();
+        let pool = rt.config.routes().get(route)?.pool_index();
+        Some(Forward::new(rt, route, pool, parts))
     }
 
     /// The hash key of `bytes` for pool `pool`'s consistent hashing.
     pub fn hash(&self, pool: usize, bytes: &[u8]) -> Option<u64> {
-        self.rt.pools.get(pool).map(|p| p.balancer.hash(bytes))
+        self.shared
+            .runtime()
+            .pools
+            .get(pool)
+            .map(|p| p.balancer.hash(bytes))
     }
 }
 
@@ -141,7 +174,7 @@ impl Drop for Proxy {
         if let Some(t) = self.checker.take() {
             let _ = t.join();
         }
-        for pool in self.rt.pools.iter() {
+        for pool in self.shared.runtime().pools.iter() {
             for conns in pool.conns.iter() {
                 conns.close_idle();
             }
@@ -149,10 +182,11 @@ impl Drop for Proxy {
     }
 }
 
-/// A handle to a running proxy: snapshots of health and counters.
+/// A handle to a running proxy: snapshots of health and counters, and live
+/// changes.
 #[derive(Clone)]
 pub struct ProxyHandle {
-    rt: Arc<Runtime>,
+    shared: Arc<Shared>,
 }
 
 impl std::fmt::Debug for ProxyHandle {
@@ -164,13 +198,13 @@ impl std::fmt::Debug for ProxyHandle {
 impl ProxyHandle {
     /// The health of every endpoint, read without locks.
     pub fn health(&self) -> HealthSnapshot {
-        let pools = self
-            .rt
+        let rt = self.shared.runtime();
+        let pools = rt
             .config
             .pools()
             .iter()
-            .zip(self.rt.pools.iter())
-            .map(|(cfg, rt)| PoolHealth {
+            .zip(rt.pools.iter())
+            .map(|(cfg, p)| PoolHealth {
                 name: cfg.name().into(),
                 endpoints: cfg
                     .endpoints()
@@ -178,15 +212,16 @@ impl ProxyHandle {
                     .enumerate()
                     .map(|(i, e)| {
                         let id = EndpointId(i as u16);
-                        let (open, idle) = rt.conns.get(i).map_or((0, 0), |c| c.counts());
+                        let (open, idle) = p.conns.get(i).map_or((0, 0), |c| c.counts());
                         EndpointHealth {
                             addr: e.addr().clone(),
-                            state: rt.health.state(id),
-                            eligible: rt.balancer.is_eligible(id),
-                            active: rt.balancer.active(id),
+                            state: p.health.state(id),
+                            eligible: p.balancer.is_eligible(id),
+                            active: p.balancer.active(id),
                             open,
                             idle,
-                            latency_ns: rt.balancer.latency(id),
+                            latency_ns: p.balancer.latency(id),
+                            ramp: p.balancer.ramp(id),
                         }
                     })
                     .collect(),
@@ -195,15 +230,69 @@ impl ProxyHandle {
         HealthSnapshot { pools }
     }
 
-    /// The proxy's counters.
+    /// The proxy's counters (they run across reloads).
     pub fn stats(&self) -> ProxyStats {
-        self.rt.counters.snapshot()
+        self.shared.counters.snapshot()
     }
 
-    /// The balancer of pool `pool`, for callers that drive the core
-    /// themselves.
-    pub fn balancer(&self, pool: usize) -> Option<&Balancer> {
-        self.rt.pools.get(pool).map(|p| &p.balancer)
+    /// Whether endpoint `id` of pool `pool` may be picked now.
+    pub fn is_eligible(&self, pool: usize, id: EndpointId) -> bool {
+        self.shared
+            .runtime()
+            .pools
+            .get(pool)
+            .is_some_and(|p| p.balancer.is_eligible(id))
+    }
+
+    /// Replaces the whole configuration while traffic flows. Exchanges in
+    /// flight finish on the configuration they started with; an endpoint in
+    /// both (same pool name and address) keeps its health and its pooled
+    /// connections; one that is gone takes nothing new.
+    ///
+    /// ```no_run
+    /// let running = proxy_net::proxy("127.0.0.1:8080", ["127.0.0.1:3000"])?;
+    /// running.handle().reload(
+    ///     proxy_net::ProxyBuilder::new().pool("default", proxy_net::Pool::new(["127.0.0.1:3001"])),
+    /// )?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The new configuration's `ConfigError`; the running one is unchanged.
+    pub fn reload(&self, builder: ProxyBuilder) -> Result<(), ConfigError> {
+        self.shared.reload(builder)
+    }
+
+    /// Replaces the endpoints of pool `pool` (what discovery does).
+    ///
+    /// # Errors
+    ///
+    /// `UnknownPool` when there is no such pool, or the new configuration's
+    /// `ConfigError`.
+    pub fn set_endpoints(&self, pool: &str, endpoints: &[Endpoint]) -> Result<(), ConfigError> {
+        let builder = self.shared.builder();
+        if !builder.has_pool(pool) {
+            return Err(ConfigError::new(
+                crate::ConfigItem::Pool(pool.into()),
+                crate::ConfigReason::UnknownPool,
+            ));
+        }
+        let builder = builder.map_pools(|name, p| {
+            if name == pool {
+                p.with_endpoints(endpoints)
+            } else {
+                p
+            }
+        });
+        self.shared.swap(builder)
+    }
+
+    /// Drains one endpoint: it takes no new exchanges, finishes the ones in
+    /// flight, and its idle connections close; it stays draining across
+    /// reloads. `false` when there is no such endpoint.
+    pub fn drain_endpoint(&self, pool: &str, endpoint: &EndpointAddr) -> bool {
+        self.shared.drain(pool, endpoint)
     }
 }
 
@@ -243,4 +332,6 @@ pub struct EndpointHealth {
     pub idle: u32,
     /// Its latency estimate, in nanoseconds.
     pub latency_ns: u64,
+    /// Its slow-start share, in percent (100 when it is not ramping).
+    pub ramp: u32,
 }

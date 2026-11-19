@@ -13,7 +13,7 @@ use serve_net::{
 };
 
 use crate::client::forward::{Failure, Forward, RequestParts};
-use crate::client::runtime::Runtime;
+use crate::client::runtime::{Runtime, Shared};
 use crate::config::ProxyBuilder;
 use crate::core::{BodyFacts, ErrorClass, RefusalKind, RouteMatch, check_request, detect_loop};
 use crate::observe::Counters;
@@ -103,7 +103,9 @@ impl Proxy {
     /// body limit at least `Limits::max_request_body`; see [`Proxy::serve`].
     pub fn service(&self) -> ProxyService {
         ProxyService {
-            rt: Arc::clone(&self.rt),
+            shared: Arc::clone(&self.shared),
+            #[cfg(feature = "ws")]
+            bridges: Arc::default(),
         }
     }
 
@@ -115,14 +117,24 @@ impl Proxy {
     ///
     /// `Serve` when the listener cannot be bound.
     pub fn serve<A: ToSocketAddrs>(self, listen: A) -> Result<Running, ProxyError> {
-        let limits =
-            serve_net::Limits::default().max_body(self.rt.config.limits().max_request_body_value());
+        let limits = serve_net::Limits::default().max_body(
+            self.shared
+                .runtime()
+                .config
+                .limits()
+                .max_request_body_value(),
+        );
         let server = Server::builder()
             .listener(ListenerSpec::tcp("proxy", listen))
             .workers(Workers::blocking(WORKERS))
             .limits(limits)
             .serve(self.service())
             .map_err(ProxyError::Serve)?;
+        // The address PROXY headers and `by=` name (serve-net does not hand
+        // the local address to services).
+        if let Some(addr) = server.local_addr() {
+            self.shared.set_listener(addr);
+        }
         Ok(Running {
             server,
             proxy: self,
@@ -134,7 +146,9 @@ impl Proxy {
 /// in `head`, then forwards it, streaming the body up and the response down.
 #[derive(Clone)]
 pub struct ProxyService {
-    rt: Arc<Runtime>,
+    shared: Arc<Shared>,
+    #[cfg(feature = "ws")]
+    bridges: Arc<crate::ws::Bridges>,
 }
 
 impl fmt::Debug for ProxyService {
@@ -163,13 +177,13 @@ fn host_of<'a>(head: &HttpHead<'a>) -> &'a [u8] {
 }
 
 impl ProxyService {
-    fn refuse(&self, class: ErrorClass) -> HeadAction {
-        Counters::add(&self.rt.counters.refused);
-        self.rt.observer.refused(class);
+    fn refuse(&self, rt: &Runtime, class: ErrorClass) -> HeadAction {
+        Counters::add(&rt.counters.refused);
+        rt.observer.refused(class);
         HeadAction::refuse(class.status().unwrap_or(400))
     }
 
-    fn parts(&self, head: &HttpHead<'_>, pool: usize) -> RequestParts {
+    fn parts(&self, rt: &Runtime, head: &HttpHead<'_>, pool: usize) -> RequestParts {
         let target = match head.query() {
             Some(q) => format!("{}?{}", head.path(), q),
             None => head.path().to_string(),
@@ -181,23 +195,19 @@ impl ProxyService {
             None => BodyFacts::None,
         };
         let client = head.client().socket_addr();
-        let key = self
-            .rt
-            .config
-            .pool_at(pool)
-            .and_then(|p| match p.balance() {
-                crate::Balance::ConsistentHash { key, .. } => {
-                    let bytes: Option<Vec<u8>> = match key {
-                        HashKey::ClientAddress => client.map(|c| c.ip().to_string().into_bytes()),
-                        HashKey::Header(name) => head.header(name).map(<[u8]>::to_vec),
-                        HashKey::Cookie(name) => cookie(head.header("cookie"), name),
-                        HashKey::Path => Some(head.path().as_bytes().to_vec()),
-                        HashKey::PathAndQuery => Some(target.as_bytes().to_vec()),
-                    };
-                    bytes.and_then(|b| self.rt.pools.get(pool).map(|r| r.balancer.hash(&b)))
-                }
-                _ => None,
-            });
+        let key = rt.config.pool_at(pool).and_then(|p| match p.balance() {
+            crate::Balance::ConsistentHash { key, .. } => {
+                let bytes: Option<Vec<u8>> = match key {
+                    HashKey::ClientAddress => client.map(|c| c.ip().to_string().into_bytes()),
+                    HashKey::Header(name) => head.header(name).map(<[u8]>::to_vec),
+                    HashKey::Cookie(name) => cookie(head.header("cookie"), name),
+                    HashKey::Path => Some(head.path().as_bytes().to_vec()),
+                    HashKey::PathAndQuery => Some(target.as_bytes().to_vec()),
+                };
+                bytes.and_then(|b| rt.pools.get(pool).map(|r| r.balancer.hash(&b)))
+            }
+            _ => None,
+        });
         RequestParts {
             method: head.method_str().into(),
             target: target.into_boxed_str(),
@@ -207,7 +217,117 @@ impl ProxyService {
             https: head.client().scheme() == Scheme::Https,
             body,
             key,
+            peer: head.client().peer(),
+            hops: head.client().hops(),
+            request_id: rt.config.request_id().map(|_| {
+                self.shared
+                    .next_request_id()
+                    .into_bytes()
+                    .into_boxed_slice()
+            }),
         }
+    }
+
+    /// Opens the upstream WebSocket and asks serve-net for the client's.
+    #[cfg(feature = "ws")]
+    fn bridge(
+        &self,
+        rt: &Runtime,
+        route: usize,
+        pool: usize,
+        head: &HttpHead<'_>,
+        env: &mut Envelope,
+    ) -> HeadAction {
+        let wants_websocket = head.header("upgrade").is_some_and(|u| {
+            u.split(|b| *b == b',')
+                .any(|p| p.trim_ascii().eq_ignore_ascii_case(b"websocket"))
+        });
+        if !wants_websocket || head.method_str() != "GET" {
+            return self.refuse(rt, ErrorClass::Refused(RefusalKind::Method));
+        }
+        let target = match head.query() {
+            Some(q) => format!("{}?{}", head.path(), q),
+            None => head.path().to_string(),
+        };
+        let up = crate::ws::Upgrade {
+            fields: head.headers().collect(),
+            method: b"GET",
+            target: target.as_bytes(),
+            host: host_of(head),
+            client: head.client().socket_addr(),
+            https: head.client().scheme() == Scheme::Https,
+            peer: head.client().peer(),
+            hops: head.client().hops(),
+        };
+        match crate::ws::open(&self.bridges, rt, route, pool, &up, env.connection()) {
+            Ok(protocol) => {
+                let service = Arc::new(crate::ws::BridgeService {
+                    bridges: Arc::clone(&self.bridges),
+                });
+                let mut t = serve_net::WebSocketTarget::shared(service);
+                if let Some(p) = protocol {
+                    t = t.subprotocol(p);
+                }
+                HeadAction::Upgrade(serve_net::UpgradeTarget::WebSocket(t))
+            }
+            Err(class) => self.refuse(rt, class),
+        }
+    }
+
+    /// The route and pool of a new request in `call`: the ones `head` chose,
+    /// or, when the configuration changed since, the ones the current
+    /// configuration gives, after the same checks `head` runs.
+    fn resolve(
+        &self,
+        rt: &Runtime,
+        head: &HttpHead<'_>,
+        word: u64,
+    ) -> Result<(usize, usize), Failure> {
+        let refuse = |class: ErrorClass, status: Option<u16>| {
+            Counters::add(&rt.counters.refused);
+            rt.observer.refused(class);
+            Failure {
+                class,
+                status: status.or(class.status()).or(Some(400)),
+            }
+        };
+        let no_route = ErrorClass::Refused(RefusalKind::NoRoute);
+        let (generation, index) = ((word >> 32) as u32, (word & 0xffff_ffff) as usize);
+        let route = if generation == rt.generation {
+            index.checked_sub(1).ok_or_else(|| refuse(no_route, None))?
+        } else {
+            let config = &rt.config;
+            let method = head.method_str().as_bytes();
+            let (index, route) =
+                match config
+                    .routes()
+                    .find(host_of(head), head.path().as_bytes(), method)
+                {
+                    RouteMatch::Route { index, route } => (index, route),
+                    RouteMatch::UnknownHost => {
+                        return Err(refuse(
+                            ErrorClass::Refused(RefusalKind::UnknownHost),
+                            Some(config.unknown_host().status()),
+                        ));
+                    }
+                    _ => return Err(refuse(no_route, None)),
+                };
+            if let Some(p) = config.via() {
+                if detect_loop(head.header_all("via"), p) {
+                    return Err(refuse(ErrorClass::Loop, None));
+                }
+            }
+            check_request(method, head.path().as_bytes(), has_body(head), route)
+                .map_err(|class| refuse(class, None))?;
+            index
+        };
+        let pool = rt
+            .config
+            .routes()
+            .get(route)
+            .map(|r| r.pool_index())
+            .ok_or_else(|| refuse(no_route, None))?;
+        Ok((route, pool))
     }
 
     fn answer(failure: Failure, reply: &mut HttpReply) -> Outcome {
@@ -224,6 +344,11 @@ impl ProxyService {
     }
 }
 
+/// True when the request says it has a body.
+fn has_body(head: &HttpHead<'_>) -> bool {
+    head.content_length().is_some_and(|n| n > 0) || head.header("transfer-encoding").is_some()
+}
+
 /// The value of cookie `name` in a `Cookie` field.
 fn cookie(field: Option<&[u8]>, name: &str) -> Option<Vec<u8>> {
     let field = field?;
@@ -236,7 +361,8 @@ fn cookie(field: Option<&[u8]>, name: &str) -> Option<Vec<u8>> {
 
 impl HttpService for ProxyService {
     fn head(&self, head: &HttpHead<'_>, env: &mut Envelope) -> HeadAction {
-        let config = &self.rt.config;
+        let rt = self.shared.runtime();
+        let config = &rt.config;
         let method = head.method_str().as_bytes();
         let route = match config
             .routes()
@@ -245,57 +371,61 @@ impl HttpService for ProxyService {
             RouteMatch::Route { index, route } => (index, route),
             RouteMatch::UnknownHost => {
                 return self
-                    .refuse(ErrorClass::Refused(RefusalKind::UnknownHost))
+                    .refuse(&rt, ErrorClass::Refused(RefusalKind::UnknownHost))
                     .with_status(config.unknown_host().status());
             }
-            _ => return self.refuse(ErrorClass::Refused(RefusalKind::NoRoute)),
+            _ => return self.refuse(&rt, ErrorClass::Refused(RefusalKind::NoRoute)),
         };
         if let Some(p) = config.via() {
             if detect_loop(head.header_all("via"), p) {
-                return self.refuse(ErrorClass::Loop);
+                return self.refuse(&rt, ErrorClass::Loop);
             }
         }
-        let has_body = head.content_length().is_some_and(|n| n > 0)
-            || head.header("transfer-encoding").is_some();
-        if let Err(class) = check_request(method, head.path().as_bytes(), has_body, route.1) {
-            return self.refuse(class);
+        if let Err(class) = check_request(method, head.path().as_bytes(), has_body(head), route.1) {
+            return self.refuse(&rt, class);
+        }
+        #[cfg(feature = "ws")]
+        if head.is_upgrade() && route.1.websocket() {
+            return self.bridge(&rt, route.0, route.1.pool_index(), head, env);
         }
         if let Some(p) = config.pool_at(route.1.pool_index()) {
-            self.rt.observer.route_matched(route.0, p.name());
+            rt.observer.route_matched(route.0, p.name());
         }
-        env.set_user_word(route.0 as u64 + 1);
+        env.set_user_word((u64::from(rt.generation) << 32) | (route.0 as u64 + 1));
         HeadAction::ProceedWith(BodyPolicy::Stream)
     }
 
     fn call(&self, request: &HttpRequest<'_>, env: &Envelope, reply: &mut HttpReply) -> Outcome {
-        let Some(route) = env.user_word().checked_sub(1) else {
-            let _ = reply.text(500, "no route");
-            return Outcome::Done;
-        };
-        let route = route as usize;
-        let Some(pool) = self.rt.config.routes().get(route).map(|r| r.pool_index()) else {
-            let _ = reply.text(500, "no route");
-            return Outcome::Done;
-        };
-        CURRENT.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let fresh = !slot
+        let rt = self.shared.runtime();
+        let fresh = CURRENT.with(|cell| {
+            !cell
+                .borrow()
                 .as_ref()
-                .is_some_and(|c| c.connection == env.connection() && c.seq == env.seq());
-            if fresh {
-                *slot = Some(Current {
+                .is_some_and(|c| c.connection == env.connection() && c.seq == env.seq())
+        });
+        if fresh {
+            let (route, pool) = match self.resolve(&rt, request.head(), env.user_word()) {
+                Ok(found) => found,
+                Err(f) => return ProxyService::answer(f, reply),
+            };
+            let forward = Forward::new(
+                Arc::clone(&rt),
+                route,
+                pool,
+                self.parts(&rt, request.head(), pool),
+            );
+            CURRENT.with(|cell| {
+                *cell.borrow_mut() = Some(Current {
                     connection: env.connection(),
                     seq: env.seq(),
-                    forward: Forward::new(
-                        Arc::clone(&self.rt),
-                        route,
-                        pool,
-                        self.parts(request.head(), pool),
-                    ),
+                    forward,
                     relaying: false,
                     buf: Vec::new(),
                 });
-            }
+            });
+        }
+        CURRENT.with(|cell| {
+            let mut slot = cell.borrow_mut();
             let Some(current) = slot.as_mut() else {
                 return Outcome::Close;
             };
@@ -336,7 +466,7 @@ impl HttpService for ProxyService {
                 }
                 current.relaying = true;
             }
-            let max = self.rt.config.limits().relay_buffer_value() as usize;
+            let max = rt.config.limits().relay_buffer_value() as usize;
             current.buf.clear();
             match current.forward.read_body(&mut current.buf, max) {
                 Ok(ended) => {

@@ -47,6 +47,7 @@ pub struct ProxyBuilder {
     via: Option<Option<Box<str>>>,
     frame_facts: bool,
     hash_key: [u8; 16],
+    request_id: Option<Box<str>>,
     #[cfg(feature = "client")]
     extras: crate::observe::Extras,
 }
@@ -62,18 +63,33 @@ impl ProxyBuilder {
         &self,
     ) -> (
         alloc::sync::Arc<dyn crate::observe::Observer>,
-        alloc::sync::Arc<dyn crate::client::Connector>,
+        Option<alloc::sync::Arc<dyn crate::client::Connector>>,
     ) {
         (
             self.extras
                 .observer
                 .clone()
                 .unwrap_or_else(|| alloc::sync::Arc::new(crate::observe::NoObserver)),
-            self.extras
-                .connector
-                .clone()
-                .unwrap_or_else(|| alloc::sync::Arc::new(crate::client::TcpConnector::new())),
+            self.extras.connector.clone(),
         )
+    }
+
+    /// The builder with each pool replaced by `f(name, pool)`.
+    pub(crate) fn map_pools(mut self, mut f: impl FnMut(&str, Pool) -> Pool) -> ProxyBuilder {
+        let pools = core::mem::take(&mut self.pools);
+        self.pools = pools
+            .into_iter()
+            .map(|(name, pool)| {
+                let pool = f(&name, pool);
+                (name, pool)
+            })
+            .collect();
+        self
+    }
+
+    /// True when a pool named `name` was added.
+    pub(crate) fn has_pool(&self, name: &str) -> bool {
+        self.pools.iter().any(|(n, _)| &**n == name)
     }
 }
 
@@ -169,6 +185,19 @@ impl ProxyBuilder {
         self
     }
 
+    /// Writes a request id field named `name` on every upstream request: a
+    /// client's id is kept when it is a token of at most 64 bytes, and
+    /// replaced with a new one otherwise. Default: off.
+    ///
+    /// ```
+    /// let b = proxy_net::ProxyBuilder::new().request_id("x-request-id");
+    /// # let _ = b;
+    /// ```
+    pub fn request_id(mut self, name: &str) -> ProxyBuilder {
+        self.request_id = Some(syntax::lower(name));
+        self
+    }
+
     /// Checks the configuration without keeping it.
     ///
     /// # Errors
@@ -228,6 +257,13 @@ impl ProxyBuilder {
                 Some(p)
             }
         };
+        let request_id = match self.request_id {
+            Some(n) if !syntax::is_token(n.as_bytes()) => {
+                return Err(proxy(ConfigReason::HeaderName));
+            }
+            Some(n) if rewrite::is_reserved(&n) => return Err(proxy(ConfigReason::ReservedHeader)),
+            other => other,
+        };
         let mut pools: Vec<PoolConfig> = Vec::with_capacity(self.pools.len());
         for (name, pool) in self.pools {
             if pools.iter().any(|p| p.name() == &*name) {
@@ -268,6 +304,7 @@ impl ProxyBuilder {
             via,
             frame_facts: self.frame_facts,
             hash_key: self.hash_key,
+            request_id,
         })
     }
 }
@@ -294,6 +331,7 @@ pub struct Config {
     via: Option<Box<str>>,
     frame_facts: bool,
     hash_key: [u8; 16],
+    request_id: Option<Box<str>>,
 }
 
 impl Config {
@@ -352,6 +390,11 @@ impl Config {
     /// The consistent-hashing key.
     pub fn hash_key(&self) -> [u8; 16] {
         self.hash_key
+    }
+
+    /// The request id field, when on.
+    pub fn request_id(&self) -> Option<&str> {
+        self.request_id.as_deref()
     }
 }
 

@@ -4,9 +4,15 @@
 
 pub(crate) mod checker;
 mod connector;
+pub(crate) mod discovery;
 pub(crate) mod forward;
 pub(crate) mod pool;
 pub(crate) mod runtime;
+#[cfg(feature = "tls")]
+mod tls;
 
 pub use connector::{Connector, TcpConnector, TcpUpstream, UpstreamIo};
+pub use discovery::{Discovery, DiscoveryError, DnsDiscovery, StaticDiscovery};
 pub use forward::{Failure, Forward, RequestParts, ResponseStart};
+#[cfg(feature = "tls")]
+pub use tls::TlsConnector;

@@ -37,6 +37,72 @@ pub struct RequestParts {
     pub body: BodyFacts,
     /// The balancer key for consistent hashing, if the pool hashes.
     pub key: Option<u64>,
+    /// The socket peer (the trusted proxy in front, when there is one).
+    pub peer: Option<SocketAddr>,
+    /// Proxies between the client and this one, as the inbound engine walked
+    /// them (0 for a direct client).
+    pub hops: u8,
+    /// The request id to write when the request has none.
+    pub request_id: Option<Box<[u8]>>,
+}
+
+/// The PROXY protocol header for one upstream connection. A client or
+/// destination that is unknown (or a mix of families that cannot be shown
+/// as one) gives `UNKNOWN` (v1) or `LOCAL` (v2), as a health check does.
+pub(crate) fn prelude(
+    mode: crate::ProxyProtocol,
+    client: Option<SocketAddr>,
+    destination: Option<SocketAddr>,
+    authority: &[u8],
+) -> Vec<u8> {
+    use net_io::{ProxyCommand, Tlv};
+    let pair = match (client, destination) {
+        (Some(c), Some(d)) if c.is_ipv4() == d.is_ipv4() => Some((c, d)),
+        (Some(c), Some(d)) => {
+            let six = |a: SocketAddr| match a {
+                SocketAddr::V4(v4) => {
+                    SocketAddr::new(std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+                }
+                v6 => v6,
+            };
+            Some((six(c), six(d)))
+        }
+        _ => None,
+    };
+    let mut out = vec![0u8; 512];
+    let n = match mode {
+        crate::ProxyProtocol::V1 => match pair {
+            Some((c, d)) => net_io::encode_v1(c, d, &mut out).ok(),
+            None => {
+                return b"PROXY UNKNOWN\r\n".to_vec();
+            }
+        },
+        crate::ProxyProtocol::V2 {
+            authority: with_authority,
+            crc,
+        } => {
+            let tlv = [Tlv {
+                kind: 0x02,
+                value: authority,
+            }];
+            let tlvs: &[Tlv<'_>] =
+                if with_authority && !authority.is_empty() && authority.len() <= 255 {
+                    &tlv
+                } else {
+                    &[]
+                };
+            match pair {
+                Some((c, d)) => {
+                    net_io::encode_v2(ProxyCommand::Proxy, Some(c), Some(d), tlvs, crc, &mut out)
+                        .ok()
+                }
+                None => net_io::encode_v2(ProxyCommand::Local, None, None, &[], crc, &mut out).ok(),
+            }
+        }
+        _ => Some(0),
+    };
+    out.truncate(n.unwrap_or(0));
+    out
 }
 
 /// The start of the response the client will get.
@@ -438,7 +504,16 @@ impl Forward {
                 self.conn = Some(*conn);
                 Ok(())
             }
-            Taken::Dial => match rt.connector.connect(endpoint.addr(), b"", self.deadline) {
+            Taken::Dial => match rt.pools[self.pool].connector.connect(
+                endpoint.addr(),
+                &prelude(
+                    cfg.proxy_protocol(),
+                    self.parts.client,
+                    rt.listener,
+                    &self.parts.host,
+                ),
+                self.deadline,
+            ) {
                 Ok(io) => {
                     let l = rt.config.limits();
                     let limits = http_net::Limits::default()
@@ -491,6 +566,10 @@ impl Forward {
         )
         .client(self.parts.client)
         .https(self.parts.https)
+        .listener(rt.listener)
+        .chain(self.parts.peer, self.parts.hops)
+        .request_id(self.parts.request_id.as_deref())
+        .upstream_tls(config.pool_at(self.pool).is_some_and(|p| p.tls().is_some()))
         .body(self.parts.body);
         let mut list = FieldList::new();
         let mut target = Vec::new();
@@ -672,8 +751,15 @@ impl Forward {
     }
 
     fn finish(&mut self, action: Action) {
-        let reuse = matches!(action, Action::Finish { reuse: true, .. });
+        let proxied = self
+            .rt
+            .config
+            .pool_at(self.pool)
+            .is_some_and(|p| p.proxy_protocol().is_on());
+        // A connection that carried a PROXY header speaks for one client only.
+        let reuse = matches!(action, Action::Finish { reuse: true, .. }) && !proxied;
         self.over = true;
+        self.rt.response_size(self.route, self.bytes_down);
         self.status = self.status.or(Some(200));
         Counters::add(&self.rt.counters.succeeded);
         if let (Some(mut conn), Some(id)) = (self.conn.take(), self.endpoint) {

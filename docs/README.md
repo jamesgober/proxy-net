@@ -24,18 +24,19 @@
 ## Guides
 
 - [API reference](./API.md): every public item, with examples and the version it ships in.
+- [Architecture](./ARCHITECTURE.md): the layers, the threads, how a request moves through the proxy, and how live changes swap the running state.
 - [Release notes](./release/): one file per release.
 - [Changelog](../CHANGELOG.md)
 - [Plan](../dev/PLAN.md): the design, the threats and their defences, the decision log.
 - [Roadmap](../dev/ROADMAP.md): what each version delivers, with its exit criteria.
 - [Directives](../dev/DIRECTIVES.md): the engineering standards and the definition of done.
 
-The architecture, security, performance, and platform guides arrive with the versions that build what they describe: `ARCHITECTURE.md` in 0.5, `PERFORMANCE.md` in 0.6, `SECURITY.md` in 0.7, `PLATFORM-NOTES.md` in 0.8, and `STABILITY-1.0.md` with 1.0.
+The security, performance, and platform guides arrive with the versions that build what they describe: `PERFORMANCE.md` in 0.6, `SECURITY.md` in 0.7, `PLATFORM-NOTES.md` in 0.8, and `STABILITY-1.0.md` with 1.0.
 
 ## Help
 
 - Issues: <https://github.com/jamesgober/proxy-net/issues>
-- MSRV: Rust 1.85. The feature flags in 0.4 are `serve`, `client`, and `std`, all on by default; see
+- MSRV: Rust 1.85. The feature flags are `serve`, `client`, and `std` (on by default), and `tls` and `ws`; see
   [`Cargo.toml`](../Cargo.toml).
 
 <br>
