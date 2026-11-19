@@ -13,6 +13,53 @@
 
 ---
 
+## [0.7.0] - 2026-11-20
+
+Hardening: an attack test for every threat, several proxies at once, the
+upstream bytes checked against a second parser, 24-hour fuzzing and soaks,
+and the memory an exchange holds.
+
+### Added
+
+- `tests/attacks_suite.rs`: attack tests over sockets for host routing
+  (T-8), SSRF through routing (T-9), pool poisoning (T-12), memory
+  exhaustion (T-16), topology leaks (T-18), interception (T-19), trailer
+  injection (T-21), and cache poisoning (T-22). Every threat in the model now
+  has a named test (see `docs/SECURITY.md`).
+- `tests/multi_node.rs`: a chain of two proxies, a loop between them (508),
+  and an edge that keeps serving when one of two inner proxies stops.
+- Differential checking: the bytes the forwarder writes upstream are read by
+  http-net and by an independent strict reader, for 20,000 generated
+  requests in `tests/differential.rs` and in a new `differential` fuzz
+  target; both must accept them and agree on everything.
+- `tests/memory.rs`: heap per active exchange, 27.3 KiB by default and
+  15.3 KiB with 4 KiB client reads.
+- `Inbound::read_buffer`: the client connection's read buffer (16 KiB by
+  default).
+- `PoolLimits::adaptive_concurrency` (experimental, off by default): an
+  adaptive concurrency limit per endpoint that answers 503 before the
+  endpoint starts queueing; `EndpointHealth::adaptive_limit` reports it.
+- `benches/soak.rs`: a soak with mixed traffic, a flapping origin, live
+  endpoint changes and reloads, checked every minute and at the end.
+- `benches/compare.rs knee`: the adaptive limit swept over sockets against
+  an origin with a knee.
+- `docs/SECURITY.md`: the threat model, every threat with its defence, its
+  test, and its cost, the settings that matter, and the hardening record.
+
+### Changed
+
+- The load generator in `benches/compare.rs` reads any status, so refusals
+  are counted without closing the connection.
+
+### Known gaps
+
+- serve-net 0.8 can hold messages queued for a WebSocket client until its
+  next ping when the client is sending at the same time. The two pipelined
+  bridge tests stay ignored until serve-net's fix ships.
+- The reactor path waits for serve-net and net-io (see the roadmap).
+
+---
+
 ## [0.6.0] - 2026-11-19
 
 Optimisation: the request path measured against other proxies and made
@@ -267,7 +314,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/proxy-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/proxy-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/proxy-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/proxy-net/compare/v0.3.0...v0.4.0

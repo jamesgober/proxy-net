@@ -59,11 +59,16 @@
 - [x] `wss` upstreams through the WebSocket bridge (moved from 0.5, D-048; built without the reactor, D-058).
 - Moved, with the reason in PLAN D-065: the reactor path. serve-net G-1 and net-io G-11 are still open (serve-net 0.8.2 and net-io 0.8.1 are the newest on 2026-11-19); it comes in the first version after both close. This is a hard external dependency, not a deferral by choice.
 
-## v0.7.0 - Hardening
-- [ ] 24-hour fuzz campaign per target, the full attack suite, the multi-node test, a 24-hour soak, idea I-6, `docs/SECURITY.md`.
-- [ ] When serve-net ships its fix for G-16 (a 0.8.x patch), move to it and re-enable the two ignored pipelined bridge tests (D-066), in the first proxy-net version after it ships.
-- [ ] Memory per active exchange measured under load with the soak (the 1.0 target is under 20 KiB); 0.6 measured allocations per request, not the heap an exchange holds.
-- [ ] Idea I-5 on sockets: a load sweep against a real endpoint with a knee; if it agrees with the simulation, an opt-in adaptive limit per pool (D-063).
+## v0.7.0 - Hardening (2026-11-20)
+- [ ] 24-hour fuzz campaign per target (nine targets, `differential` included).
+- [ ] 24-hour soak on Linux and on Windows (`benches/soak.rs`, D-071).
+- [x] The full attack suite: every threat T-1 to T-22 has a named test (`tests/attacks_suite.rs` adds T-8, T-9, T-12, T-16, T-18, T-19, T-21, T-22; D-069).
+- [x] The multi-node test (`tests/multi_node.rs`: a chain, a loop, failover).
+- [x] Idea I-6 (`tests/differential.rs`, the `differential` fuzz target; D-070).
+- [x] `docs/SECURITY.md`.
+- [x] Memory per active exchange: 27.3 KiB by default, 15.3 KiB with `Inbound::read_buffer(4096)`, under the 20 KiB target (`tests/memory.rs`, D-067).
+- [x] Idea I-5 on sockets: it agrees with the simulation when clients back off on 503; shipped as an experimental opt-in, `PoolLimits::adaptive_concurrency` (D-068).
+- Open, waiting on serve-net: its fix for G-16 (a 0.8.x patch); then move to it and re-enable the two ignored pipelined bridge tests (D-066), in the first proxy-net version after it ships.
 
 ## v0.8.0 - Alpha
 - [ ] A gateway deployment uses proxy-net for its proxy and load-balancer roles end to end; `docs/OPERATIONS.md`, `docs/PLATFORM-NOTES.md`.
