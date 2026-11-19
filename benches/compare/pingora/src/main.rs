@@ -12,7 +12,7 @@ impl ProxyHttp for Origin {
     fn new_ctx(&self) {}
 
     async fn upstream_peer(&self, _session: &mut Session, _ctx: &mut ()) -> Result<Box<HttpPeer>> {
-        Ok(Box::new(HttpPeer::new(("127.0.0.1", 9000), false, String::new())))
+        Ok(Box::new(HttpPeer::new(("127.0.0.1", 9000), false, String::new())?))
     }
 }
 
