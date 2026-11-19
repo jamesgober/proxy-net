@@ -345,26 +345,124 @@ pub enum RouteMatch<'a> {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct RouteTable {
     routes: Box<[CompiledRoute]>,
+    /// For each host name an exact route names, sorted by the name's hash:
+    /// the routes that can match it (those exact routes and every route that
+    /// is not exact), in table order.
+    by_host: Box<[HostEntry]>,
+    /// The positions of the routes that are not exact, in table order: the
+    /// candidates for any other host.
+    others: Box<[u32]>,
 }
+
+/// One exact host name in the route index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostEntry {
+    hash: u64,
+    name: Box<[u8]>,
+    /// The routes that can match the name, in table order.
+    routes: Box<[u32]>,
+}
+
+/// A hash of a host name that ignores ASCII case, eight bytes at a time.
+/// Setting bit 5 of every byte folds letters to lowercase and leaves the
+/// other host-name bytes (digits, `-`, `.`) as they are; for any other byte
+/// it can only make two names share a hash, and the name is compared after.
+fn host_hash(name: &[u8]) -> u64 {
+    const FOLD: u64 = 0x2020_2020_2020_2020;
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = (name.len() as u64).wrapping_mul(K);
+    let mut chunks = name.chunks_exact(8);
+    for c in &mut chunks {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(c);
+        h = (h ^ (u64::from_le_bytes(w) | FOLD))
+            .wrapping_mul(K)
+            .rotate_left(29);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut w = [0u8; 8];
+        w[..rest.len()].copy_from_slice(rest);
+        h = (h ^ (u64::from_le_bytes(w) | FOLD))
+            .wrapping_mul(K)
+            .rotate_left(29);
+    }
+    h ^ (h >> 32)
+}
+
+/// Set on a candidate whose host is already known to match: its exact
+/// pattern is the name the index found.
+const HOST_MATCHED: u32 = 1 << 31;
 
 impl RouteTable {
     /// Builds a table, refusing a route that an earlier one shadows entirely
     /// (it could never match): the error carries the later route's index and
     /// the earlier one's.
     pub(crate) fn new(routes: Vec<CompiledRoute>) -> Result<RouteTable, (usize, ConfigReason)> {
+        debug_assert!(routes.len() < HOST_MATCHED as usize);
         for (j, later) in routes.iter().enumerate() {
             if let Some(i) = routes[..j].iter().position(|r| r.covers(later)) {
                 return Err((j, ConfigReason::Shadowed { by: i }));
             }
         }
+        let others: Vec<u32> = routes
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !matches!(r.host, HostPattern::Exact(_)))
+            .map(|(i, _)| i as u32)
+            .collect();
+        let mut by_host: Vec<HostEntry> = Vec::new();
+        for r in &routes {
+            let HostPattern::Exact(name) = &r.host else {
+                continue;
+            };
+            if by_host.iter().any(|e| *e.name == *name.as_bytes()) {
+                continue;
+            }
+            let candidates: Vec<u32> = routes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| match &c.host {
+                    HostPattern::Exact(other) if other == name => Some(i as u32 | HOST_MATCHED),
+                    HostPattern::Exact(_) => None,
+                    _ => Some(i as u32),
+                })
+                .collect();
+            by_host.push(HostEntry {
+                hash: host_hash(name.as_bytes()),
+                name: name.as_bytes().into(),
+                routes: candidates.into_boxed_slice(),
+            });
+        }
+        by_host.sort_by_key(|e| e.hash);
         Ok(RouteTable {
             routes: routes.into_boxed_slice(),
+            by_host: by_host.into_boxed_slice(),
+            others: others.into_boxed_slice(),
         })
+    }
+
+    /// The positions of the routes that can match `host`, in table order.
+    fn candidates(&self, host: RequestHost<'_>) -> &[u32] {
+        let RequestHost::Name(n) = host else {
+            // An exact pattern never matches an address.
+            return &self.others;
+        };
+        let h = host_hash(n);
+        let start = self.by_host.partition_point(|e| e.hash < h);
+        self.by_host[start..]
+            .iter()
+            .take_while(|e| e.hash == h)
+            .find(|e| e.name.eq_ignore_ascii_case(n))
+            .map_or(&*self.others, |e| &*e.routes)
     }
 
     /// The first route that matches `host` (a `Host` value: case, a port, and a
     /// trailing dot are ignored), `path` (as received; anything from `?` on is
-    /// ignored), and `method`. Allocates nothing.
+    /// ignored), and `method`. Allocates nothing. Only the routes that can
+    /// match the host are tried: an index built with the table maps each
+    /// exact host name to its routes and every route that is not exact, in
+    /// table order.
     pub fn find(&self, host: &[u8], path: &[u8], method: &[u8]) -> RouteMatch<'_> {
         let path = match path.iter().position(|&b| b == b'?') {
             Some(q) => &path[..q],
@@ -372,8 +470,12 @@ impl RouteTable {
         };
         let host = request_host(host);
         let mut host_served = false;
-        for (index, route) in self.routes.iter().enumerate() {
-            if !route.host.matches(host) {
+        for &i in self.candidates(host) {
+            let index = (i & !HOST_MATCHED) as usize;
+            let Some(route) = self.routes.get(index) else {
+                continue;
+            };
+            if i & HOST_MATCHED == 0 && !route.host.matches(host) {
                 continue;
             }
             host_served = true;
@@ -420,6 +522,37 @@ mod tests {
             .map(|r| r.compile(0).expect("compile"))
             .collect();
         RouteTable::new(compiled).expect("table")
+    }
+
+    #[test]
+    fn test_the_host_index_keeps_order_case_and_exact_names() {
+        let t = table(&[
+            Route::host("*.example.com").path("/wild"),
+            Route::host("a-long-name.with-many.parts.example.com").path("/x"),
+            Route::host("api.example.com"),
+            Route::any().path("/any"),
+        ]);
+        // Case and length past one word of the hash.
+        assert_eq!(
+            index(&t, "A-LONG-NAME.With-Many.PARTS.example.com", "/x", "GET"),
+            Some(1)
+        );
+        // A wildcard before an exact route still comes first.
+        assert_eq!(
+            index(
+                &t,
+                "a-long-name.with-many.parts.example.com",
+                "/wild",
+                "GET"
+            ),
+            Some(0)
+        );
+        // Bytes the hash folds together are told apart by the name.
+        assert_eq!(index(&t, "api.example.com", "/", "GET"), Some(2));
+        assert_eq!(index(&t, "api\x0eexample.com", "/", "GET"), None);
+        // A host with no exact route falls through to the others.
+        assert_eq!(index(&t, "other.org", "/any", "GET"), Some(3));
+        assert_eq!(index(&t, "10.0.0.1", "/any", "GET"), Some(3));
     }
 
     fn index(t: &RouteTable, host: &str, path: &str, method: &str) -> Option<usize> {

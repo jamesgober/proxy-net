@@ -48,6 +48,11 @@ name = "compare"
 harness = false
 required-features = ["serve"]
 
+# Hot paths of the sans-IO core.
+[[bench]]
+name = "core"
+harness = false
+
 
 # FEATURE FLAGS
 # #################################

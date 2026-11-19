@@ -19,6 +19,21 @@ static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static ON: AtomicBool = AtomicBool::new(false);
 
+thread_local! {
+    // Const-initialised with no destructor, so the allocator can use them.
+    static MINE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MINE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The tests here measure in windows; one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn count_mine() {
+    if MINE_ON.with(std::cell::Cell::get) {
+        MINE.with(|m| m.set(m.get() + 1));
+    }
+}
+
 // SAFETY: forwards to the system allocator unchanged; the counters are
 // relaxed atomics, which allocate nothing.
 unsafe impl GlobalAlloc for Counting {
@@ -27,6 +42,7 @@ unsafe impl GlobalAlloc for Counting {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
+        count_mine();
         // SAFETY: the caller's layout, as given.
         unsafe { System.alloc(layout) }
     }
@@ -41,6 +57,7 @@ unsafe impl GlobalAlloc for Counting {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
         }
+        count_mine();
         // SAFETY: as for `dealloc`; `new_size` is the caller's.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -118,7 +135,47 @@ fn exchange(s: &mut TcpStream, count: usize) {
 const MAX_PER_REQUEST: u64 = 12;
 
 #[test]
+fn test_route_matching_allocates_nothing() {
+    let mut b = proxy_net::ProxyBuilder::new().pool("p", proxy_net::Pool::new(["10.0.0.1:80"]));
+    for h in 0..8 {
+        for path in ["/api", "/static", "/v1/users", "/"] {
+            b = b.route(
+                proxy_net::Route::host(&format!("h{h}.example.com"))
+                    .path(path)
+                    .to("p"),
+            );
+        }
+    }
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let config = b.config().expect("config");
+    let routes = config.routes();
+    MINE.with(|m| m.set(0));
+    MINE_ON.with(|m| m.set(true));
+    let mut found = 0;
+    for _ in 0..10_000 {
+        if matches!(
+            routes.find(b"H7.Example.com:443", b"/v1/users/42?x=1", b"GET"),
+            proxy_net::core::RouteMatch::Route { .. }
+        ) {
+            found += 1;
+        }
+    }
+    MINE_ON.with(|m| m.set(false));
+    assert_eq!(found, 10_000);
+    assert_eq!(
+        MINE.with(std::cell::Cell::get),
+        0,
+        "route matching allocated"
+    );
+}
+
+#[test]
 fn test_allocations_per_proxied_request_are_bounded() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let up = origin();
     let running = proxy_net::proxy("127.0.0.1:0", [up.to_string()]).expect("proxy");
     let addr = running.local_addr().expect("addr");
