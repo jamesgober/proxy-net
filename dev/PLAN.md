@@ -90,7 +90,7 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | G-4 | serve-net | at most 64 reply fields | larger responses answered 502 and reported |
 | G-5 | serve-net | a streamed reply is always chunked; no length on `HEAD` replies | known lengths sent chunked |
 | G-6 | serve-net | no raw-connection hand-off after 101 | WebSocket bridged; other upgrades refused |
-| G-7 | serve-net | built on http-net 0.9 and net-io 0.7 | two copies in the build; no type crosses |
+| G-7 | serve-net | built on http-net 0.9, net-io 0.7, and (with `ws`) ws-net 0.9 | two copies in the build; no type crosses (the bridge hands serve-net its own message type) |
 | G-8 | http-net | the planned `quirks` facts are not shipped | proxy-net's own agreement checks |
 | G-9 | http-net | `Request::forward_from` takes only an http-net head | proxy-net builds the request from a field list |
 | G-10 | net-io | `encode_v1` allocates per header | accepted: one per new upstream connection |
