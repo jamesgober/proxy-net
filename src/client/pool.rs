@@ -70,30 +70,38 @@ impl EndpointConns {
     /// than the most exchanges per connection, and its probe says it is open
     /// with nothing waiting. When every place is taken, waits up to
     /// `pending_timeout` for one (at most `max_pending` waiters).
+    ///
+    /// The lock covers only the list and the counts: the probe and any close
+    /// are system calls, made after it is released, so threads taking from
+    /// one endpoint do not queue behind each other's system calls.
     pub(crate) fn take(
         &self,
         limits: &PoolLimits,
         idempotent: bool,
         deadline: Instant,
     ) -> Result<Taken, ErrorClass> {
+        let wait_until = (Instant::now() + limits.pending_timeout_value()).min(deadline);
         let mut slots = self.lock();
-        let wait_until = Instant::now() + limits.pending_timeout_value();
-        let wait_until = wait_until.min(deadline);
         loop {
             let now = Instant::now();
             // LIFO: the most recently used connection first.
-            while let Some(mut idle) = slots.idle.pop() {
+            if let Some(idle) = slots.idle.pop() {
+                // Still counted in `open` while it is checked outside the lock.
+                drop(slots);
                 let age = now.saturating_duration_since(idle.since);
                 let fresh = idempotent || age < limits.fresh_for_value();
                 let usable = age < limits.idle_timeout_value()
                     && idle.conn.exchanges < limits.max_exchanges_per_connection_value()
                     && fresh;
-                if usable && idle.conn.io.is_reusable() {
-                    idle.conn.reused = true;
-                    return Ok(Taken::Pooled(idle.conn));
+                let mut conn = idle.conn;
+                if usable && conn.io.is_reusable() {
+                    conn.reused = true;
+                    return Ok(Taken::Pooled(conn));
                 }
-                idle.conn.io.close();
+                conn.io.close();
+                slots = self.lock();
                 slots.open = slots.open.saturating_sub(1);
+                continue;
             }
             if slots.open < self.max_open {
                 slots.open += 1;
@@ -112,53 +120,77 @@ impl EndpointConns {
         }
     }
 
+    /// Wakes one waiter when there is one. `slots` is released first.
+    fn freed_one(&self, slots: std::sync::MutexGuard<'_, Slots>) {
+        let waiting = slots.pending > 0;
+        drop(slots);
+        if waiting {
+            self.freed.notify_one();
+        }
+    }
+
     /// A dial for a place from `take` failed: the place is free again.
     pub(crate) fn dial_failed(&self) {
         let mut slots = self.lock();
         slots.open = slots.open.saturating_sub(1);
-        drop(slots);
-        self.freed.notify_one();
+        self.freed_one(slots);
     }
 
     /// The exchange is over: the connection goes back to the pool when
-    /// `reuse` holds and the pool has room, and is closed otherwise.
+    /// `reuse` holds and the pool has room, and is closed otherwise. A close
+    /// happens before its place is freed, so the endpoint never has more
+    /// sockets open than its cap.
     pub(crate) fn release(&self, mut conn: UpstreamConn, reuse: bool, max_idle: u32) {
-        let mut slots = self.lock();
-        if reuse && (slots.idle.len() as u64) < u64::from(max_idle) {
+        if reuse {
             let _ = conn.http.shrink_idle();
-            slots.idle.push(Idle {
-                conn,
-                since: Instant::now(),
-            });
-        } else {
-            conn.io.close();
-            slots.open = slots.open.saturating_sub(1);
+            let mut slots = self.lock();
+            if (slots.idle.len() as u64) < u64::from(max_idle) {
+                slots.idle.push(Idle {
+                    conn,
+                    since: Instant::now(),
+                });
+                self.freed_one(slots);
+                return;
+            }
         }
-        drop(slots);
-        self.freed.notify_one();
+        conn.io.close();
+        let mut slots = self.lock();
+        slots.open = slots.open.saturating_sub(1);
+        self.freed_one(slots);
     }
 
     /// Closes idle connections older than `idle_timeout` (the health checker
-    /// runs it on its schedule, so nothing polls for it).
+    /// runs it on its schedule, so nothing polls for it). The closes happen
+    /// after the lock is released.
     pub(crate) fn sweep(&self, idle_timeout: Duration) {
-        let mut slots = self.lock();
         let now = Instant::now();
-        let before = slots.idle.len();
-        let mut kept = Vec::with_capacity(before);
-        for mut idle in slots.idle.drain(..) {
+        let mut slots = self.lock();
+        if slots
+            .idle
+            .iter()
+            .all(|i| now.saturating_duration_since(i.since) < idle_timeout)
+        {
+            return;
+        }
+        let mut stale = Vec::new();
+        let mut kept = Vec::with_capacity(slots.idle.len());
+        for idle in slots.idle.drain(..) {
             if now.saturating_duration_since(idle.since) < idle_timeout {
                 kept.push(idle);
             } else {
-                idle.conn.io.close();
+                stale.push(idle);
             }
         }
-        let closed = before - kept.len();
         slots.idle = kept;
+        drop(slots);
+        let closed = stale.len();
+        for mut idle in stale {
+            idle.conn.io.close();
+        }
+        let mut slots = self.lock();
         slots.open = slots.open.saturating_sub(closed as u32);
         drop(slots);
-        if closed > 0 {
-            self.freed.notify_all();
-        }
+        self.freed.notify_all();
     }
 
     /// Open connections (in use and idle) and idle ones.

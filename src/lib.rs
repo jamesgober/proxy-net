@@ -108,7 +108,7 @@ pub use observe::{Finished, NoObserver, Observer, ProxyStats};
 #[cfg(feature = "client")]
 pub use proxy::{EndpointHealth, HealthSnapshot, PoolHealth, Proxy, ProxyError, ProxyHandle};
 #[cfg(feature = "serve")]
-pub use serve::{ProxyService, Running, proxy};
+pub use serve::{Inbound, ProxyService, Running, proxy};
 
 // The README's and the API reference's examples run as doctests, so their
 // claims are checked against the build.
