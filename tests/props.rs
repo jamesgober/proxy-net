@@ -91,7 +91,11 @@ proptest! {
                 Action::Retry { .. } => {
                     retries += 1;
                     prop_assert!(!relayed, "retry after relay");
-                    prop_assert!(method != "POST", "POST retried");
+                    // A POST retries only from a failure while connecting.
+                    prop_assert!(
+                        method != "POST" || matches!(e, Event::ConnectFailed(_) | Event::Tick),
+                        "POST retried after {:?}", e
+                    );
                     prop_assert!(replayable, "unreplayable retried");
                 }
                 Action::Finish { .. } | Action::Fail { .. } => endings += 1,

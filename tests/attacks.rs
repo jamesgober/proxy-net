@@ -147,17 +147,27 @@ fn test_t10_h2c_upgrade_is_not_forwarded() {
 fn test_t14_post_is_never_sent_twice() {
     let c = single();
     let pool = &c.pools()[0];
-    for failure in [
-        ErrorClass::Connect,
-        ErrorClass::UpstreamReset,
-        ErrorClass::Tls,
-    ] {
+    // Once the request may have reached the upstream, a POST is not retried.
+    for failure in [ErrorClass::UpstreamReset, ErrorClass::UpstreamStatus] {
+        let mut ex = Exchange::new(b"POST", true, pool, Tick(0));
+        let _ = ex.on(Event::Start, Tick(0));
+        let _ = ex.on(Event::Picked(EndpointId(0)), Tick(0));
+        let _ = ex.on(Event::Connected, Tick(0));
+        let _ = ex.on(Event::Sent, Tick(0));
+        let action = ex.on(Event::UpstreamFailed(failure), Tick(0));
+        assert!(
+            matches!(action, Action::Fail { .. }),
+            "{failure:?}: {action:?}"
+        );
+    }
+    // A failure while connecting is retried: the request never left.
+    for failure in [ErrorClass::Connect, ErrorClass::Tls] {
         let mut ex = Exchange::new(b"POST", true, pool, Tick(0));
         let _ = ex.on(Event::Start, Tick(0));
         let _ = ex.on(Event::Picked(EndpointId(0)), Tick(0));
         let action = ex.on(Event::ConnectFailed(failure), Tick(0));
         assert!(
-            matches!(action, Action::Fail { .. }),
+            matches!(action, Action::Retry { .. }),
             "{failure:?}: {action:?}"
         );
     }

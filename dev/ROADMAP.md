@@ -32,17 +32,20 @@
 - [x] Exit: `core` builds for a `no_std` target (`aarch64-unknown-none`, D-025); every 0.3 requirement tested.
 - Moved to 0.4, with the reason in PLAN D-030: `ProxyBuilder::hash_key`.
 
-## v0.4.0 - Forwarding
-- [ ] Dependencies: http-net 0.10, parse-net 0.7, net-io 0.8, serve-net 0.8.
-- [ ] `Connector`, `TcpConnector`, the connection pool, the upstream connection, the active health checker, slow start, breaker caps.
-- [ ] `ProxyBuilder::hash_key` (moved from 0.3, D-030).
-- [ ] `ProxyService`, `Proxy`, `Running`, Tier 1 `proxy`; streaming both ways; timeouts and retries; 100-continue, 1xx, trailers; `Observer`; health and stats snapshots.
-- [ ] Defence ideas I-2 and I-3.
-- [ ] Tests: real-socket proxying, socket-level attacks, loom; fuzz `upstream_response`; differential test.
-- [ ] Exit: Tier 1 forwards real traffic on Linux, macOS, and Windows.
+## v0.4.0 - Forwarding (2026-11-19)
+- [x] Dependencies: http-net 0.10, parse-net 0.7, net-io 0.8.1, serve-net 0.8.2.
+- [x] `Connector`, `TcpConnector`, the connection pool, the upstream connection, the active health checker, breaker caps (endpoint caps with a bounded wait).
+- [x] `ProxyBuilder::hash_key` (moved from 0.3, D-030).
+- [x] `ProxyService`, `Proxy`, `Running`, Tier 1 `proxy`; streaming both ways; timeouts and retries; 100-continue (serve-net answers it), 1xx and trailers (dropped until serve-net G-2 and G-3); `Observer`; health and stats snapshots.
+- [x] Defence ideas I-2 (desync tripwire) and I-3 (fresh connections for non-idempotent requests).
+- [x] Tests: real-socket proxying, socket-level attacks, loom; fuzz `upstream_response`.
+- [x] Exit: Tier 1 forwards real traffic on Linux, macOS, and Windows.
+- Moved to 0.5, with the reason in PLAN D-042: slow start.
+- Moved to 0.7, where idea I-6 builds it: the differential test against a second parser (the socket attack tests already parse everything the upstream receives with http-net).
 
 ## v0.5.0 - Feature complete
 - [ ] WebSocket bridge (`ws`), TLS to upstreams (`tls`), PROXY protocol to upstreams.
+- [ ] Slow start (moved from 0.4, D-042).
 - [ ] Append mode for forwarding headers, `by` nodes, request ids.
 - [ ] Live reload, draining, `Discovery` (static, DNS), the discovery allowlist.
 - [ ] Defence idea I-4; `docs/ARCHITECTURE.md`.

@@ -35,7 +35,7 @@ The architecture, security, performance, and platform guides arrive with the ver
 ## Help
 
 - Issues: <https://github.com/jamesgober/proxy-net/issues>
-- MSRV: Rust 1.85. The only feature flag in 0.3 is `std` (on by default); see
+- MSRV: Rust 1.85. The feature flags in 0.4 are `serve`, `client`, and `std`, all on by default; see
   [`Cargo.toml`](../Cargo.toml).
 
 <br>

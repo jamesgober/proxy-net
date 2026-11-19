@@ -7,14 +7,19 @@
 //!
 //! ## Status
 //!
-//! `0.3.0` ships the configuration surface and the sans-IO core: endpoints,
-//! routes and the compiled route table, pools and their policies, and in
-//! [`core`] the balancers, endpoint health, the retry budget, the request
-//! checks, head rewriting, and [`core::Exchange`], the forwarding state
-//! machine. Nothing forwards traffic over sockets yet: the serve-net service
-//! and the upstream client arrive in `0.4.0`. The full API, with the version
-//! each part ships in, is in `docs/API.md` in the
+//! `0.4.0` forwards real traffic. [`proxy`] puts a listener in front of a set
+//! of servers in one line; [`ProxyBuilder`] builds pools, routes, and health
+//! checks, and [`ProxyBuilder::build`] starts a [`Proxy`]. The decisions live
+//! in [`core`] (sans-IO); [`client`] drives them against real connections; the
+//! serve-net service is [`ProxyService`]. The full API, with the version each
+//! part ships in, is in `docs/API.md` in the
 //! [repository](https://github.com/jamesgober/proxy-net).
+//!
+//! ```no_run
+//! let running = proxy_net::proxy("127.0.0.1:8080", ["127.0.0.1:3000", "127.0.0.1:3001"])?;
+//! running.wait();
+//! # Ok::<(), proxy_net::ProxyError>(())
+//! ```
 //!
 //! ## Example
 //!
@@ -42,6 +47,8 @@
 //!
 //! | Feature | Default | What it adds |
 //! |---|---|---|
+//! | `serve` | yes | the serve-net service, `Proxy::serve`, and `proxy` (implies `client`) |
+//! | `client` | yes | the upstream side: connections, the pool, the forwarder, the health checker (implies `std`) |
 //! | `std` | yes | `std` integration; without it the crate needs only `alloc` (and 64-bit atomics) |
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -63,13 +70,21 @@
 
 extern crate alloc;
 
+#[cfg(feature = "client")]
+pub mod client;
 mod config;
 pub mod core;
 mod endpoint;
 mod error;
+#[cfg(feature = "client")]
+mod observe;
 mod pool;
+#[cfg(feature = "client")]
+mod proxy;
 mod rewrite;
 mod route;
+#[cfg(feature = "serve")]
+mod serve;
 mod syntax;
 
 pub use config::{
@@ -84,6 +99,13 @@ pub use pool::{
 };
 pub use rewrite::{FORWARDING_SET, HeaderRule, HostHeader, PathCheck, PathPolicy};
 pub use route::Route;
+
+#[cfg(feature = "client")]
+pub use observe::{Finished, NoObserver, Observer, ProxyStats};
+#[cfg(feature = "client")]
+pub use proxy::{EndpointHealth, HealthSnapshot, PoolHealth, Proxy, ProxyError, ProxyHandle};
+#[cfg(feature = "serve")]
+pub use serve::{ProxyService, Running, proxy};
 
 // The README's and the API reference's examples run as doctests, so their
 // claims are checked against the build.

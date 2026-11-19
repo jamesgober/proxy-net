@@ -282,10 +282,13 @@ impl Exchange {
         Action::Fail { class, status }
     }
 
-    /// True when the request may be sent again after `class`.
+    /// True when the request may be sent again after `class`. A failure
+    /// while connecting (the request never left the proxy) may be retried
+    /// for any method; after that, only for an idempotent one.
     fn may_retry(&self, class: ErrorClass) -> bool {
+        let before_send = self.state == State::Connecting;
         usize::from(self.attempt) < usize::from(self.max_attempts)
-            && self.idempotent
+            && (self.idempotent || before_send)
             && self.replayable
             && !self.relayed
             && class.is_retryable()
@@ -459,6 +462,29 @@ mod tests {
         assert!(matches!(
             ex.on(Event::Connected, Tick(0)),
             Action::Send { .. }
+        ));
+    }
+
+    #[test]
+    fn test_non_idempotent_retries_only_before_sending() {
+        // The request never left the proxy: a connect failure is retried for
+        // a POST too.
+        let mut ex = Exchange::new(b"POST", true, &two(), Tick(0));
+        let _ = ex.on(Event::Start, Tick(0));
+        let _ = ex.on(Event::Picked(EndpointId(0)), Tick(0));
+        assert_eq!(
+            ex.on(Event::ConnectFailed(ErrorClass::Connect), Tick(0)),
+            Action::Retry {
+                class: ErrorClass::Connect
+            }
+        );
+        // A POST whose body is not held is not, even then.
+        let mut ex = Exchange::new(b"POST", false, &two(), Tick(0));
+        let _ = ex.on(Event::Start, Tick(0));
+        let _ = ex.on(Event::Picked(EndpointId(0)), Tick(0));
+        assert!(matches!(
+            ex.on(Event::ConnectFailed(ErrorClass::Connect), Tick(0)),
+            Action::Fail { .. }
         ));
     }
 

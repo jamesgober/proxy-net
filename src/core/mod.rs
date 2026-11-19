@@ -33,3 +33,9 @@ pub use health::{EndpointId, EndpointState, HealthTable, Transition};
 pub use path::{check_path, check_request};
 pub use route::{CompiledRoute, PathRewrite, RouteMatch, RouteTable};
 pub use tick::Tick;
+
+/// A well-mixed pseudo-random value from a sequence number (for jitter).
+#[cfg(feature = "client")]
+pub(crate) fn jitter(seq: u64) -> u64 {
+    hash::mix(seq)
+}

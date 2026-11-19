@@ -59,3 +59,10 @@ path  = "fuzz_targets/exchange.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "upstream_response"
+path  = "fuzz_targets/upstream_response.rs"
+test  = false
+doc   = false
+bench = false

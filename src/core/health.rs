@@ -6,10 +6,9 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
-use super::atomic::update_u32;
+use super::atomic::{AtomicU32, AtomicU64, Ordering, update_u32};
 use super::class::Outcome;
 use super::tick::Tick;
 use crate::pool::PoolConfig;
