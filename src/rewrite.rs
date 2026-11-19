@@ -196,7 +196,7 @@ pub enum PathCheck {
     EncodedSlash,
     /// A raw `\`.
     Backslash,
-    /// `%00`.
+    /// `%00`, or a raw NUL.
     EncodedNul,
     /// `;` inside a segment matched by a prefix route (`/app/..;/admin`).
     Semicolon,

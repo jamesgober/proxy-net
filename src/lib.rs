@@ -7,15 +7,14 @@
 //!
 //! ## Status
 //!
-//! `0.2.0` is the design lock. It ships the configuration surface, built and
-//! checked: endpoints, routes and the compiled route table, pools and their
-//! policies (balancing, health checks, passive health, retries, timeouts,
-//! connection limits), header rules, path safety policies, forwarding
-//! headers, and the proxy-wide limits. Nothing forwards traffic yet: the
-//! sans-IO core (balancing, health, head rewriting, the forwarding state
-//! machine) lands in `0.3.0`, and the serve-net service and the upstream
-//! client in `0.4.0`. The full API, with the version each part ships in, is
-//! in `docs/API.md` in the [repository](https://github.com/jamesgober/proxy-net).
+//! `0.3.0` ships the configuration surface and the sans-IO core: endpoints,
+//! routes and the compiled route table, pools and their policies, and in
+//! [`core`] the balancers, endpoint health, the retry budget, the request
+//! checks, head rewriting, and [`core::Exchange`], the forwarding state
+//! machine. Nothing forwards traffic over sockets yet: the serve-net service
+//! and the upstream client arrive in `0.4.0`. The full API, with the version
+//! each part ships in, is in `docs/API.md` in the
+//! [repository](https://github.com/jamesgober/proxy-net).
 //!
 //! ## Example
 //!
@@ -43,7 +42,7 @@
 //!
 //! | Feature | Default | What it adds |
 //! |---|---|---|
-//! | `std` | yes | `std` integration; without it the crate needs only `alloc` |
+//! | `std` | yes | `std` integration; without it the crate needs only `alloc` (and 64-bit atomics) |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![doc(html_root_url = "https://docs.rs/proxy-net")]
@@ -78,7 +77,7 @@ pub use config::{
     UnknownHost,
 };
 pub use endpoint::{DEFAULT_MAX_CONNECTIONS, Endpoint, EndpointAddr};
-pub use error::{ConfigError, ConfigItem, ConfigReason, EndpointErrorKind};
+pub use error::{ConfigError, ConfigItem, ConfigReason, EndpointErrorKind, ForwardError};
 pub use pool::{
     Balance, CheckKind, HashKey, HealthCheck, MAX_ENDPOINTS, Outlier, Pool, PoolConfig, PoolLimits,
     Retry, Timeouts,

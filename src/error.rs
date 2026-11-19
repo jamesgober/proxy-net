@@ -3,6 +3,8 @@
 use alloc::boxed::Box;
 use core::fmt;
 
+use crate::core::{EndpointId, ErrorClass};
+
 /// A configuration that cannot be built.
 ///
 /// [`item`](ConfigError::item) says where the problem is and
@@ -250,6 +252,61 @@ impl fmt::Display for EndpointErrorKind {
     }
 }
 
+/// What ended one exchange: the class, the endpoint of the last attempt,
+/// and the attempt number.
+///
+/// ```
+/// use proxy_net::ForwardError;
+/// use proxy_net::core::{EndpointId, ErrorClass};
+/// let e = ForwardError::new(ErrorClass::Connect, Some(EndpointId(2)), 2);
+/// assert_eq!(e.class(), ErrorClass::Connect);
+/// assert_eq!(e.to_string(), "the upstream could not be reached (endpoint 2, attempt 2)");
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForwardError {
+    class: ErrorClass,
+    endpoint: Option<EndpointId>,
+    attempt: u8,
+}
+
+impl ForwardError {
+    /// An error of `class` on `endpoint` at `attempt`.
+    pub fn new(class: ErrorClass, endpoint: Option<EndpointId>, attempt: u8) -> ForwardError {
+        ForwardError {
+            class,
+            endpoint,
+            attempt,
+        }
+    }
+
+    /// What ended the exchange.
+    pub fn class(&self) -> ErrorClass {
+        self.class
+    }
+
+    /// The endpoint of the last attempt, if one was picked.
+    pub fn endpoint(&self) -> Option<EndpointId> {
+        self.endpoint
+    }
+
+    /// The attempt number, from 1.
+    pub fn attempt(&self) -> u8 {
+        self.attempt
+    }
+}
+
+impl fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.class)?;
+        match self.endpoint {
+            Some(e) => write!(f, " (endpoint {}, attempt {})", e.0, self.attempt),
+            None => write!(f, " (attempt {})", self.attempt),
+        }
+    }
+}
+
+impl core::error::Error for ForwardError {}
+
 #[cfg(test)]
 mod tests {
     use alloc::string::ToString;
@@ -286,6 +343,14 @@ mod tests {
         );
         let e = ConfigError::new(ConfigItem::Proxy, ConfigReason::NoRoutes);
         assert!(e.to_string().starts_with("proxy: "));
+    }
+
+    #[test]
+    fn test_forward_error_display() {
+        let e = ForwardError::new(ErrorClass::NoEndpoint, None, 1);
+        assert_eq!(e.to_string(), "no upstream is available (attempt 1)");
+        assert_eq!(e.endpoint(), None);
+        assert_eq!(e.attempt(), 1);
     }
 
     #[test]

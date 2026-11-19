@@ -281,6 +281,14 @@ impl CompiledRoute {
         !NO_BODY.contains(&method) || self.body_methods.iter().any(|m| m.as_bytes() == method)
     }
 
+    /// True when the route names `method` in its own method list (a route
+    /// without a list names none).
+    pub fn lists_method(&self, method: &[u8]) -> bool {
+        self.methods
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|m| m.as_bytes() == method))
+    }
+
     fn matches_method(&self, method: &[u8]) -> bool {
         match &self.methods {
             None => true,

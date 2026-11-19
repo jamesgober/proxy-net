@@ -51,7 +51,7 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
 
   no_std:
-    name: no_std build (thumbv7em-none-eabihf / ${{ matrix.rust }})
+    name: no_std build (aarch64-unknown-none / ${{ matrix.rust }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -62,12 +62,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          targets: thumbv7em-none-eabihf
+          targets: aarch64-unknown-none
       - uses: Swatinem/rust-cache@v2
       # A target without std proves the configuration types and the core need
       # only `alloc`; the host `--no-default-features` test cannot show that.
+      # The balancers and health table use 64-bit atomics, so the target is
+      # one that has them.
       - name: Build the library for a target without std
-        run: cargo build --lib --no-default-features --target thumbv7em-none-eabihf
+        run: cargo build --lib --no-default-features --target aarch64-unknown-none
 
   fuzz:
     name: Fuzz smoke (60 s per target)
@@ -81,7 +83,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          [endpoint, route_pattern, route_match]
+          [endpoint, route_pattern, route_match, path_check, request_fields, exchange]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master

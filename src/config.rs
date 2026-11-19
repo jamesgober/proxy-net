@@ -45,6 +45,7 @@ pub struct ProxyBuilder {
     forwarded: Forwarded,
     strip: Vec<Box<str>>,
     via: Option<Option<Box<str>>>,
+    frame_facts: bool,
 }
 
 impl ProxyBuilder {
@@ -107,6 +108,21 @@ impl ProxyBuilder {
     /// Writes no `Via` and does no loop detection.
     pub fn no_via(mut self) -> ProxyBuilder {
         self.via = Some(None);
+        self
+    }
+
+    /// Adds a `proxy-frame` field to every upstream request, stating how the
+    /// proxy framed it (`length=N`, `chunked`, or `none`, and the field
+    /// count), so an upstream that parses it can detect a framing
+    /// disagreement. A `proxy-frame` field from a client is always removed.
+    /// Default: off.
+    ///
+    /// ```
+    /// let b = proxy_net::ProxyBuilder::new().frame_facts(true);
+    /// # let _ = b;
+    /// ```
+    pub fn frame_facts(mut self, on: bool) -> ProxyBuilder {
+        self.frame_facts = on;
         self
     }
 
@@ -207,6 +223,7 @@ impl ProxyBuilder {
             forwarded: self.forwarded,
             stripped: stripped.into_boxed_slice(),
             via,
+            frame_facts: self.frame_facts,
         })
     }
 }
@@ -231,6 +248,7 @@ pub struct Config {
     forwarded: Forwarded,
     stripped: Box<[Box<str>]>,
     via: Option<Box<str>>,
+    frame_facts: bool,
 }
 
 impl Config {
@@ -279,6 +297,11 @@ impl Config {
     /// The `Via` pseudonym, or `None` when `Via` is off.
     pub fn via(&self) -> Option<&str> {
         self.via.as_deref()
+    }
+
+    /// Whether upstream requests carry the `proxy-frame` field.
+    pub fn frame_facts(&self) -> bool {
+        self.frame_facts
     }
 }
 

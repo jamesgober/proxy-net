@@ -2,7 +2,7 @@
 
 > The design, strategy, and decision record for `proxy-net`. A living document: every design decision, idea, or open question about proxy-net is written here or in [`ROADMAP.md`](./ROADMAP.md) before it is acted on.
 >
-> **Status:** `0.2.0`, design lock (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
+> **Status:** `0.3.0`, the sans-IO core (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
 
 ---
 
@@ -67,13 +67,13 @@ Every threat gets an attack test named after it, in the version that ships its d
 | Crate | Version | Why | From |
 |---|---|---|---|
 | http-net | 0.10 | upstream request writing and response parsing, hop-by-hop helpers | 0.3 |
-| parse-net | 0.7 (the version http-net 0.10 pins) | `Forwarded` writing and parsing, list parsing | 0.3 |
+| parse-net | 0.7 (the version http-net 0.10 pins) | `Forwarded` writing and parsing, list parsing (`Connection`, `Via`) | 0.3 (added) |
 | net-io | 0.8 | outbound connections, PROXY encoders | 0.4 |
 | serve-net | 0.8 | the inbound side | 0.4 |
 | tls-net | 0.10 | TLS to upstreams (feature `tls`) | 0.5 |
 | ws-net | 0.10 | the WebSocket bridge (feature `ws`) | 0.5 |
 
-`0.2.0` has no dependencies. Each one is added with the first code that needs it.
+Each dependency is added with the first code that needs it: parse-net in 0.3, the others in 0.4 and 0.5.
 
 ## 6. What proxy-net needs from other crates
 
@@ -139,3 +139,13 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | D-021 | 2026-11-19 | Header rules cannot touch framing, hop-by-hop, `Host`, `Via`, `Expect`, or the forwarding set | the proxy writes those itself; a rule there is either a no-op or a hole |
 | D-022 | 2026-11-19 | Configuration getters on builder-style types end in `_value` (`weight_value()`) | the setter takes the plain name; one type serves as builder and value |
 | D-023 | 2026-11-19 | Fuzz targets live in `fuzz/` (cargo-fuzz), with the corpus outside the repository and a 60 s smoke run per target in CI | standard 2.11; the fuzz crate's dependencies never reach the library |
+| D-024 | 2026-11-19 | The core takes parse-net 0.7 in 0.3 and does its own hop-by-hop removal over parse-net's list parser; http-net joins in 0.4 with the upstream client | the core needs the list grammar and `Forwarded` writing now, and serve-net hands its services its own head view, so http-net's `RequestHead` helpers cannot be fed directly anyway (G-9) |
+| D-025 | 2026-11-19 | The core needs 64-bit atomics; the `no_std` CI target is `aarch64-unknown-none` | lock-free balancers and health words need them, and every target a proxy runs on has them; a 32-bit microcontroller target proves nothing useful here |
+| D-026 | 2026-11-19 | Weighted round robin is a schedule built once by stride scheduling (the k-th turn of an endpoint at (2k + 1) / 2w), walked with one atomic counter | exact counts per cycle and even spacing, with no lock on the pick path (the nginx loop needs a lock or a CAS on every endpoint per pick); build is O(S log S) with S at most 65,536 |
+| D-027 | 2026-11-19 | An ineligible endpoint's Maglev slots fall to the next slots of the table instead of rebuilding the table | only the failed endpoint's keys move, the table is immutable (no swap on the pick path), and the bounded load already walks the same probe order |
+| D-028 | 2026-11-19 | Timeouts after the request was sent are never retried; a connect timeout is | the upstream may still be working on the request; retrying it doubles the load at the worst moment |
+| D-029 | 2026-11-19 | Compare-and-swap loops are written out (`core::atomic`) instead of `fetch_update` | `fetch_update` is deprecated on new toolchains in favour of a method the MSRV does not have |
+| D-030 | 2026-11-19 | The consistent-hashing key is fixed (all zero) in 0.3; `ProxyBuilder::hash_key` comes in 0.4 | nodes must agree, which the fixed key gives; nothing in 0.3 takes traffic, so an unpredictable key only matters once requests arrive |
+| D-031 | 2026-11-19 | Property tests use proptest (dev-dependency only) | standard 2.11; the resolver picks a release that builds on 1.85 |
+| D-032 | 2026-11-19 | Idea I-1 ships as `frame_facts` (off by default), and a client's `proxy-frame` is always removed | a framing statement a client could forge would be worse than none |
+| D-033 | 2026-11-19 | With the default ejection cap (50%), a pool of one endpoint is never ejected | ejecting the only endpoint refuses everything; the panic threshold would send traffic to it anyway |

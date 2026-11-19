@@ -38,3 +38,24 @@ path  = "fuzz_targets/route_match.rs"
 test  = false
 doc   = false
 bench = false
+
+[[bin]]
+name  = "path_check"
+path  = "fuzz_targets/path_check.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "request_fields"
+path  = "fuzz_targets/request_fields.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "exchange"
+path  = "fuzz_targets/exchange.rs"
+test  = false
+doc   = false
+bench = false
