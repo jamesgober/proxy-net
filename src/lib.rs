@@ -86,6 +86,16 @@ pub use pool::{
 pub use rewrite::{FORWARDING_SET, HeaderRule, HostHeader, PathCheck, PathPolicy};
 pub use route::Route;
 
+// The README's and the API reference's examples run as doctests, so their
+// claims are checked against the build.
+#[cfg(all(doctest, feature = "std"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(all(doctest, feature = "std"))]
+#[doc = include_str!("../docs/API.md")]
+struct ApiDoctests;
+
 /// Crate version string, populated by Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

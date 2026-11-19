@@ -1,6 +1,24 @@
-# proxy-net API Reference
+<h1 align="center">
+        <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
+    <br><b>proxy-net</b><br>
+    <sub><sup>API REFERENCE</sup></sub>
+</h1>
+<div align="center">
+    <sup>
+        <a href="../README.md" title="Project Home"><b>HOME</b></a>
+        <span>&nbsp;│&nbsp;</span>
+        <a href="./README.md" title="Documentation"><b>DOCS</b></a>
+        <span>&nbsp;│&nbsp;</span>
+        <span>API</span>
+    </sup>
+</div>
+<br>
 
-> Every public item of `proxy-net`, with examples. **Version `0.2.0`, the design lock.** This file is the API contract: the items marked *shipped* are in the crate now; the items marked with a later version are the locked shape of what comes next, and their names and signatures change only with a migration note.
+> Every public item of `proxy-net`: what it does, its parameters, its errors,
+> and examples. **Version `0.2.0`, the design lock.** This file is the API
+> contract: items marked *shipped* are in this build; items marked with a
+> later version are the locked shape of what comes next, and their names and
+> signatures change only with a migration note.
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -87,7 +105,7 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 
 *0.4.0.* Listens on `listen` and forwards every request to the given endpoints: one pool, round robin, passive health, the default limits and timeouts, and forwarding headers in both styles.
 
-```rust
+```rust,ignore
 pub fn proxy<A, I, S>(listen: A, upstreams: I) -> Result<Running, ProxyError>
 where
     A: std::net::ToSocketAddrs,
@@ -110,7 +128,7 @@ Errors: `ProxyError::Config` (an endpoint does not parse), `ProxyError::Serve` (
 
 *Shipped.* Collects pools, routes, limits, and forwarding settings, and checks them all at once.
 
-```rust
+```rust,ignore
 impl ProxyBuilder {
     pub fn new() -> ProxyBuilder;
     pub fn pool(self, name: &str, pool: Pool) -> ProxyBuilder;
@@ -173,7 +191,7 @@ Errors: the first problem found, as a [`ConfigError`](#configerror) naming the p
 
 *Shipped.* The validated configuration. Immutable; from 0.5 a reload replaces it whole.
 
-```rust
+```rust,ignore
 impl Config {
     pub fn routes(&self) -> &RouteTable;
     pub fn pool(&self, name: &str) -> Option<&PoolConfig>;
@@ -231,7 +249,7 @@ Errors: `ConfigReason::Limit { field: "limits.<name>" }` on the proxy.
 
 *Shipped (settings); written from 0.3, `append_trusted` from 0.5.* Every field in [`FORWARDING_SET`](#constants) that a client sent is always removed; these settings say what the proxy writes instead.
 
-```rust
+```rust,ignore
 impl Forwarded {
     pub fn both() -> Forwarded;          // Forwarded and X-Forwarded-* (the default)
     pub fn standard() -> Forwarded;      // Forwarded (RFC 7239) only
@@ -275,7 +293,7 @@ assert_eq!(proxy_net::UnknownHost::Misdirected.status(), 421);
 
 *Shipped.* One upstream endpoint: its address, weight, tier, connection cap, and server name.
 
-```rust
+```rust,ignore
 impl Endpoint {
     pub fn parse(text: &str) -> Result<Endpoint, ConfigError>;
     pub fn new(addr: EndpointAddr) -> Endpoint;
@@ -317,7 +335,7 @@ Errors: `EndpointSyntax(kind)`; `weight`, `tier`, and `max_connections` are chec
 
 *Shipped.*
 
-```rust
+```rust,ignore
 pub enum EndpointAddr { Ip(SocketAddr), Name { host: Box<str>, port: u16 } }
 impl EndpointAddr {
     pub fn port(&self) -> u16;
@@ -342,7 +360,7 @@ assert_eq!(e.addr().port(), 8080);
 
 *Shipped (matching and validation); rewrites applied from 0.3; `websocket` from 0.5.*
 
-```rust
+```rust,ignore
 impl Route {
     pub fn any() -> Route;
     pub fn host(pattern: &str) -> Route;
@@ -403,7 +421,7 @@ Errors (as `ConfigError` on `Route(index)`): `HostPattern`, `PathPattern`, `Meth
 
 *Shipped (validation); applied from 0.3.*
 
-```rust
+```rust,ignore
 pub enum HeaderRule { Set(Box<str>, Box<str>), Add(Box<str>, Box<str>), Remove(Box<str>) }
 impl HeaderRule {
     pub fn set(name: &str, value: &str) -> HeaderRule;
@@ -453,7 +471,7 @@ let route = Route::any().to("app").path_policy(policy);
 
 *Shipped (settings).*
 
-```rust
+```rust,ignore
 impl Pool {
     pub fn new<I, S>(endpoints: I) -> Pool where I: IntoIterator<Item = S>, S: AsRef<str>;
     pub fn endpoint(self, endpoint: Endpoint) -> Pool;
@@ -641,7 +659,7 @@ Decisions without sockets, threads, or clocks; needs only `alloc`.
 
 *Shipped.*
 
-```rust
+```rust,ignore
 impl RouteTable {
     pub fn find(&self, host: &[u8], path: &[u8], method: &[u8]) -> RouteMatch<'_>;
     pub fn len(&self) -> usize;
@@ -693,7 +711,7 @@ The locked shape of what follows 0.2. Names and signatures here change only with
 
 ### 0.3.0: the core
 
-```rust
+```rust,ignore
 pub struct Tick(pub u64);                         // nanoseconds from the caller's origin
 pub struct Balancer;                              // pick(key, exclude), started(id), finished(id, outcome, latency)
 pub struct HealthTable;                           // record(id, outcome, now), check_result(id, ok, now), state(id)
@@ -710,7 +728,7 @@ pub struct ForwardError;                          // class(), endpoint(), attemp
 
 ### 0.4.0: forwarding
 
-```rust
+```rust,ignore
 pub fn proxy(listen, upstreams) -> Result<Running, ProxyError>;
 impl ProxyBuilder { pub fn build(self) -> Result<Proxy, ConfigError>; pub fn observer(self, o: impl Observer) -> ProxyBuilder; }
 impl Proxy { pub fn handle(&self) -> ProxyHandle; pub fn service(&self) -> ProxyService; pub fn serve(self, listen) -> Result<Running, ProxyError>; }
@@ -727,7 +745,7 @@ Until serve-net can park a streamed reply, `ProxyService` needs serve-net's bloc
 
 ### 0.5.0: feature complete
 
-```rust
+```rust,ignore
 impl Pool {
     pub fn proxy_protocol(self, version: ProxyProtocol) -> Pool;   // Off, V1, V2 { authority, alpn, unique_id, crc }
     pub fn tls(self, tls: UpstreamTls) -> Pool;                    // roots, pinning, SNI, client certificates
