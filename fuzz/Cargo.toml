@@ -17,6 +17,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary     = { version = "1", features = ["derive"] }
 proxy-net     = { path = ".." }
+parse-net     = { version = "0.7", default-features = false, features = ["alloc"] }
 
 [[bin]]
 name  = "endpoint"
@@ -63,6 +64,13 @@ bench = false
 [[bin]]
 name  = "upstream_response"
 path  = "fuzz_targets/upstream_response.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "forwarded_append"
+path  = "fuzz_targets/forwarded_append.rs"
 test  = false
 doc   = false
 bench = false

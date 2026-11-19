@@ -412,6 +412,22 @@ impl HealthTable {
     pub fn ejected_count(&self) -> u32 {
         self.ejected.load(Ordering::Acquire)
     }
+
+    /// Copies endpoint `from_id`'s state in `from` to endpoint `id` here (a
+    /// reload keeps the health of endpoints present in both).
+    #[cfg(feature = "client")]
+    pub(crate) fn adopt(&self, id: EndpointId, from: &HealthTable, from_id: EndpointId) {
+        let (Some(slot), Some(old)) = (self.slot(id), from.slot(from_id)) else {
+            return;
+        };
+        let word = old.word.load(Ordering::Acquire);
+        slot.until
+            .store(old.until.load(Ordering::Acquire), Ordering::Release);
+        slot.word.store(word, Ordering::Release);
+        if Word::unpack(word).state == EJECTED {
+            let _ = self.ejected.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 #[cfg(test)]

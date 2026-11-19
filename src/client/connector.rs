@@ -106,13 +106,14 @@ fn connect_class(e: &NetError) -> ErrorClass {
     }
 }
 
-impl Connector for TcpConnector {
-    fn connect(
+impl TcpConnector {
+    /// The TCP connection, with `prelude` sent.
+    pub(crate) fn dial(
         &self,
         endpoint: &EndpointAddr,
         prelude: &[u8],
         deadline: Instant,
-    ) -> Result<Box<dyn UpstreamIo>, ErrorClass> {
+    ) -> Result<TcpConnection, ErrorClass> {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(ErrorClass::Timeout(TimeoutKind::Connect));
@@ -130,7 +131,19 @@ impl Connector for TcpConnector {
             up.send(prelude, deadline)
                 .map_err(|_| ErrorClass::Connect)?;
         }
-        Ok(Box::new(up))
+        Ok(up.conn)
+    }
+}
+
+impl Connector for TcpConnector {
+    fn connect(
+        &self,
+        endpoint: &EndpointAddr,
+        prelude: &[u8],
+        deadline: Instant,
+    ) -> Result<Box<dyn UpstreamIo>, ErrorClass> {
+        let conn = self.dial(endpoint, prelude, deadline)?;
+        Ok(Box::new(TcpUpstream { conn }))
     }
 }
 

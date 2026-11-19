@@ -129,3 +129,92 @@ fn test_response_rules_and_framing() {
         [("etag", &b"\"x\""[..]), ("server", b"edge")]
     );
 }
+
+fn forward_with(c: &Config, fields: &[(&str, &[u8])], facts: ForwardFacts<'_>) -> FieldList {
+    let (mut out, mut target) = (FieldList::new(), Vec::new());
+    request_fields(
+        fields,
+        &facts,
+        c.routes().get(0).expect("route"),
+        c,
+        &mut out,
+        &mut target,
+    )
+    .expect("forward");
+    out
+}
+
+#[test]
+fn test_append_mode_keeps_the_trusted_hops_and_adds_the_peer() {
+    let c = config(base().forwarded(Forwarded::both().append_trusted()));
+    let e = &c.pools()[0].endpoints()[0];
+    let client = "192.0.2.7:1".parse().ok();
+    let peer = "10.1.1.1:5".parse().ok();
+    // One trusted hop: the element the trusted proxy added stays, anything
+    // the client wrote before it goes, and the peer is this hop's client.
+    let fields: &[(&str, &[u8])] = &[
+        ("Forwarded", b"for=203.0.113.9, for=192.0.2.7"),
+        ("X-Forwarded-For", b"203.0.113.9, 192.0.2.7"),
+    ];
+    let facts = ForwardFacts::new(b"GET", b"/", b"example.com", e)
+        .client(client)
+        .chain(peer, 1);
+    let out = forward_with(&c, fields, facts);
+    assert_eq!(
+        out.get("forwarded"),
+        Some(&b"for=192.0.2.7, for=10.1.1.1;proto=http;host=example.com"[..])
+    );
+    assert_eq!(
+        out.get("x-forwarded-for"),
+        Some(&b"192.0.2.7, 10.1.1.1"[..])
+    );
+    // A direct client (no trusted hop) replaces the chain as before.
+    let facts = ForwardFacts::new(b"GET", b"/", b"example.com", e)
+        .client(client)
+        .chain(client, 0);
+    let out = forward_with(&c, fields, facts);
+    assert_eq!(
+        out.get("forwarded"),
+        Some(&b"for=192.0.2.7;proto=http;host=example.com"[..])
+    );
+    assert_eq!(out.get("x-forwarded-for"), Some(&b"192.0.2.7"[..]));
+}
+
+#[test]
+fn test_append_mode_with_a_chain_that_does_not_parse_replaces_it() {
+    let c = config(base().forwarded(Forwarded::standard().append_trusted()));
+    let e = &c.pools()[0].endpoints()[0];
+    let facts = ForwardFacts::new(b"GET", b"/", b"example.com", e)
+        .client("192.0.2.7:1".parse().ok())
+        .chain("10.1.1.1:5".parse().ok(), 1);
+    let out = forward_with(&c, &[("Forwarded", b"for=\"unclosed")], facts);
+    assert_eq!(
+        out.get("forwarded"),
+        Some(&b"for=192.0.2.7;proto=http;host=example.com"[..])
+    );
+}
+
+#[test]
+fn test_request_ids_keep_a_sane_client_value_and_replace_others() {
+    let c = config(base().request_id("x-request-id"));
+    let e = &c.pools()[0].endpoints()[0];
+    let ours = b"0123456789abcdef0123456789abcdef";
+    let long = [b'a'; 65];
+    for (given, want) in [
+        (None, &ours[..]),
+        (Some(&b"client-token_1"[..]), &b"client-token_1"[..]),
+        (Some(&b"has space"[..]), &ours[..]),
+        (Some(&b""[..]), &ours[..]),
+        (Some(&long[..]), &ours[..]),
+    ] {
+        let fields: Vec<(&str, &[u8])> = given.map(|g| ("X-Request-Id", g)).into_iter().collect();
+        let facts = ForwardFacts::new(b"GET", b"/", b"example.com", e).request_id(Some(ours));
+        let out = forward_with(&c, &fields, facts);
+        assert_eq!(out.get_all("x-request-id").collect::<Vec<_>>(), [want]);
+    }
+    // Without the setting the field passes as any other.
+    let c = config(base());
+    let facts = ForwardFacts::new(b"GET", b"/", b"example.com", e).request_id(Some(ours));
+    let out = forward_with(&c, &[], facts);
+    assert_eq!(out.get("x-request-id"), None);
+}

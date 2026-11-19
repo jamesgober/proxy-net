@@ -9,6 +9,7 @@ use core::time::Duration;
 use crate::endpoint::{self, Endpoint};
 use crate::error::{ConfigError, ConfigItem, ConfigReason};
 use crate::syntax;
+use crate::upstream::{Cidr, ProxyProtocol, UpstreamTls};
 
 /// The most endpoints one pool may hold.
 pub const MAX_ENDPOINTS: usize = 4096;
@@ -37,6 +38,13 @@ pub struct Pool {
     retry: Retry,
     timeouts: Timeouts,
     limits: PoolLimits,
+    proxy_protocol: ProxyProtocol,
+    tls: Option<UpstreamTls>,
+    slow_start: Duration,
+    allow: Vec<Cidr>,
+    allow_error: Option<ConfigError>,
+    #[cfg(feature = "client")]
+    discovery: Option<crate::client::discovery::DiscoverySlot>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +74,13 @@ impl Pool {
             retry: Retry::default(),
             timeouts: Timeouts::default(),
             limits: PoolLimits::default(),
+            proxy_protocol: ProxyProtocol::Off,
+            tls: None,
+            slow_start: Duration::ZERO,
+            allow: Vec::new(),
+            allow_error: None,
+            #[cfg(feature = "client")]
+            discovery: None,
         }
     }
 
@@ -119,13 +134,92 @@ impl Pool {
         self
     }
 
+    /// The PROXY protocol header sent at the start of each upstream
+    /// connection. With one on, connections are never reused (each carries
+    /// one client). Default off.
+    pub fn proxy_protocol(mut self, version: ProxyProtocol) -> Pool {
+        self.proxy_protocol = version;
+        self
+    }
+
+    /// TLS toward the endpoints (feature `tls` to connect with it).
+    pub fn tls(mut self, tls: UpstreamTls) -> Pool {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// An endpoint that becomes healthy again takes a growing share of
+    /// traffic over this long, from a tenth of its weight to all of it. Not
+    /// applied to consistent hashing (it would move keys). Default 0 (off).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// let pool = proxy_net::Pool::new(["10.0.0.1:80"]).slow_start(Duration::from_secs(30));
+    /// # let _ = pool;
+    /// ```
+    pub fn slow_start(mut self, ramp: Duration) -> Pool {
+        self.slow_start = ramp;
+        self
+    }
+
+    /// Address ranges that endpoints from discovery must be in; one outside
+    /// them is refused. Default: none, which allows every address except
+    /// loopback, link-local (where cloud metadata services live),
+    /// unspecified, multicast, and broadcast; name those here to allow them.
+    ///
+    /// ```
+    /// let pool = proxy_net::Pool::new(Vec::<&str>::new()).discovery_allow(&["10.0.0.0/8"]);
+    /// # let _ = pool;
+    /// ```
+    pub fn discovery_allow(mut self, ranges: &[&str]) -> Pool {
+        match crate::upstream::parse_ranges(ranges) {
+            Ok(r) => self.allow = r,
+            Err(e) => self.allow_error = Some(e),
+        }
+        self
+    }
+
+    /// Replaces the endpoints (live changes and discovery).
+    #[cfg(feature = "client")]
+    pub(crate) fn with_endpoints(mut self, endpoints: &[Endpoint]) -> Pool {
+        self.endpoints = endpoints
+            .iter()
+            .cloned()
+            .map(PendingEndpoint::Parsed)
+            .collect();
+        self
+    }
+
+    #[cfg(feature = "client")]
+    pub(crate) fn set_discovery(&mut self, slot: crate::client::discovery::DiscoverySlot) {
+        self.discovery = Some(slot);
+    }
+
+    #[cfg(feature = "client")]
+    pub(crate) fn discovery_slot(&self) -> Option<&crate::client::discovery::DiscoverySlot> {
+        self.discovery.as_ref()
+    }
+
+    /// The discovery allowlist.
+    #[cfg(feature = "client")]
+    pub(crate) fn allowlist(&self) -> &[Cidr] {
+        &self.allow
+    }
+
     /// Checks everything and returns the pool's validated form.
     pub(crate) fn compile(self, name: &str) -> Result<PoolConfig, ConfigError> {
         let pool_err = |reason| ConfigError::new(ConfigItem::Pool(name.into()), reason);
         if !valid_pool_name(name) {
             return Err(pool_err(ConfigReason::PoolName));
         }
-        if self.endpoints.is_empty() {
+        if let Some(e) = self.allow_error {
+            return Err(e.at(ConfigItem::Pool(name.into())));
+        }
+        #[cfg(feature = "client")]
+        let discovered = self.discovery.is_some();
+        #[cfg(not(feature = "client"))]
+        let discovered = false;
+        if self.endpoints.is_empty() && !discovered {
             return Err(pool_err(ConfigReason::NoEndpoints));
         }
         if self.endpoints.len() > MAX_ENDPOINTS {
@@ -162,6 +256,14 @@ impl Pool {
         self.retry.validate().map_err(pool_err)?;
         self.timeouts.validate().map_err(pool_err)?;
         self.limits.validate().map_err(pool_err)?;
+        if let Some(t) = &self.tls {
+            t.validate().map_err(pool_err)?;
+        }
+        if self.slow_start > Duration::from_secs(3600) {
+            return Err(pool_err(ConfigReason::Limit {
+                field: "slow_start",
+            }));
+        }
         Ok(PoolConfig {
             name: name.into(),
             endpoints: endpoints.into_boxed_slice(),
@@ -171,6 +273,10 @@ impl Pool {
             retry: self.retry,
             timeouts: self.timeouts,
             limits: self.limits,
+            proxy_protocol: self.proxy_protocol,
+            tls: self.tls,
+            slow_start: self.slow_start,
+            allow: self.allow.into_boxed_slice(),
         })
     }
 }
@@ -204,6 +310,10 @@ pub struct PoolConfig {
     retry: Retry,
     timeouts: Timeouts,
     limits: PoolLimits,
+    proxy_protocol: ProxyProtocol,
+    tls: Option<UpstreamTls>,
+    slow_start: Duration,
+    allow: Box<[Cidr]>,
 }
 
 impl PoolConfig {
@@ -245,6 +355,26 @@ impl PoolConfig {
     /// The connection limits.
     pub fn limits(&self) -> &PoolLimits {
         &self.limits
+    }
+
+    /// The PROXY protocol setting.
+    pub fn proxy_protocol(&self) -> ProxyProtocol {
+        self.proxy_protocol
+    }
+
+    /// The TLS settings, if TLS is on.
+    pub fn tls(&self) -> Option<&UpstreamTls> {
+        self.tls.as_ref()
+    }
+
+    /// The slow start ramp (zero when off).
+    pub fn slow_start(&self) -> Duration {
+        self.slow_start
+    }
+
+    /// The discovery allowlist (empty: every address).
+    pub fn discovery_allow(&self) -> &[Cidr] {
+        &self.allow
     }
 }
 

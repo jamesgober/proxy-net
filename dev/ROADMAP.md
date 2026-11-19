@@ -43,23 +43,26 @@
 - Moved to 0.5, with the reason in PLAN D-042: slow start.
 - Moved to 0.7, where idea I-6 builds it: the differential test against a second parser (the socket attack tests already parse everything the upstream receives with http-net).
 
-## v0.5.0 - Feature complete
-- [ ] WebSocket bridge (`ws`), TLS to upstreams (`tls`), PROXY protocol to upstreams.
-- [ ] Slow start (moved from 0.4, D-042).
-- [ ] Append mode for forwarding headers, `by` nodes, request ids.
-- [ ] Live reload, draining, `Discovery` (static, DNS), the discovery allowlist.
-- [ ] Defence idea I-4; `docs/ARCHITECTURE.md`.
+## v0.5.0 - Feature complete (2026-11-19)
+- [x] WebSocket bridge (`ws`), TLS to upstreams (`tls`), PROXY protocol to upstreams.
+- [x] Slow start (moved from 0.4, D-042; built as ramps, D-051).
+- [x] Append mode for forwarding headers, `by` nodes, request ids.
+- [x] Live reload, draining, `Discovery` (static, DNS), the discovery allowlist.
+- [x] Defence idea I-4; `docs/ARCHITECTURE.md`.
+- [x] Tests: live changes, PROXY protocol, request ids, the bridge (T-7 and T-11), TLS settings; fuzz `forwarded_append`.
+- Moved to 0.6, with the reason in PLAN D-048: `wss` upstreams through the bridge. It needs one thread to read and write the TLS stream, which is the reactor path 0.6 builds (or a split from tls-net, G-15). Plain `ws` upstreams are bridged now; a `wss` upstream answers 502, so nothing passes unencrypted by mistake.
 
 ## v0.6.0 - Optimisation
 - [ ] Benchmarks against nginx, HAProxy, Envoy, and Pingora; counting-allocator proofs; `docs/PERFORMANCE.md`.
 - [ ] The reactor path once serve-net G-1 and net-io G-11 have closed (see PLAN section 6). If they have not, the reactor path moves to the first version after they close; this is a hard external dependency, not a deferral by choice.
 - [ ] Idea I-5 as an experiment; decide OD-3.
+- [ ] `wss` upstreams through the WebSocket bridge (moved from 0.5, D-048).
 
 ## v0.7.0 - Hardening
 - [ ] 24-hour fuzz campaign per target, the full attack suite, the multi-node test, a 24-hour soak, idea I-6, `docs/SECURITY.md`.
 
 ## v0.8.0 - Alpha
-- [ ] WASP's gateway uses proxy-net for its proxy and load-balancer roles end to end; `docs/OPERATIONS.md`, `docs/PLATFORM-NOTES.md`.
+- [ ] A gateway deployment uses proxy-net for its proxy and load-balancer roles end to end; `docs/OPERATIONS.md`, `docs/PLATFORM-NOTES.md`.
 
 ## v0.9.0 - Beta
 - [ ] API frozen except for simplicity fixes; a 72-hour soak; an adversarial review with every finding fixed test-first.

@@ -79,6 +79,19 @@ pub trait Observer: Send + Sync + 'static {
     fn desync(&self, endpoint: &EndpointAddr, leftover: usize) {
         let _ = (endpoint, leftover);
     }
+
+    /// A response on `route` of `bytes` is far above the route's usual
+    /// `mean` (over 8 times it, after 100 responses): a sign of a confused
+    /// upstream or of data leaving that should not. Reported, never blocked.
+    fn response_outlier(&self, route: usize, bytes: u64, mean: u64) {
+        let _ = (route, bytes, mean);
+    }
+
+    /// Discovery for `pool` failed or gave nothing usable; the pool keeps the
+    /// endpoints it had.
+    fn discovery_failed(&self, pool: &str, why: &str) {
+        let _ = (pool, why);
+    }
 }
 
 /// The observer that observes nothing.

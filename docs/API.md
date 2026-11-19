@@ -15,7 +15,7 @@
 <br>
 
 > Every public item of `proxy-net`: what it does, its parameters, its errors,
-> and examples. **Version `0.4.0`, forwarding.** This file is the API
+> and examples. **Version `0.5.0`, feature complete.** This file is the API
 > contract: items marked *shipped* are in this build; items marked with a
 > later version are the locked shape of what comes next, and their names and
 > signatures change only with a migration note.
@@ -38,6 +38,13 @@
   - [`Observer`, `NoObserver`, `Finished`](#observer-noobserver-finished)
   - [`ProxyService`](#proxyservice)
   - [`ProxyError`](#proxyerror)
+- [Live changes](#live-changes)
+  - [`reload`, `set_endpoints`, `drain_endpoint`](#reload-set_endpoints-drain_endpoint)
+  - [`Discovery`, `StaticDiscovery`, `DnsDiscovery`](#discovery-staticdiscovery-dnsdiscovery)
+- [Upstream protocols](#upstream-protocols)
+  - [`ProxyProtocol`](#proxyprotocol)
+  - [`UpstreamTls`, `UpstreamRoots`, `TlsConnector`](#upstreamtls-upstreamroots-tlsconnector)
+  - [The WebSocket bridge](#the-websocket-bridge)
 - [The upstream side (`proxy_net::client`)](#the-upstream-side-proxy_netclient)
   - [`Connector`, `UpstreamIo`, `TcpConnector`](#connector-upstreamio-tcpconnector)
   - [`Forward`, `RequestParts`, `ResponseStart`, `Failure`](#forward-requestparts-responsestart-failure)
@@ -64,6 +71,7 @@
   - [`Retry`](#retry)
   - [`Timeouts`](#timeouts)
   - [`PoolLimits`](#poollimits)
+  - [`Cidr`](#cidr)
 - [Errors](#errors)
   - [`ConfigError`](#configerror)
   - [`ConfigItem`](#configitem)
@@ -82,7 +90,7 @@
   - [`Exchange`, `Event`, `Action`](#exchange-event-action)
   - [`ErrorClass`, `Outcome`, `ForwardError`](#errorclass-outcome-forwarderror)
 - [Constants](#constants)
-- [Planned items](#planned-items)
+- [Changes from the planned 0.5 shape](#changes-from-the-planned-05-shape)
 
 ---
 
@@ -105,7 +113,7 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 | 0.2.0 | the configuration surface, built and checked (this file's *shipped* items) |
 | 0.3.0 | the sans-IO core: balancing, health, retry accounting, head rewriting, path safety, loop detection, the exchange state machine (*shipped*) |
 | 0.4.0 | forwarding over real sockets: the serve-net service, the upstream client and connection pool, active health checks, Tier 1 (*shipped*) |
-| 0.5.0 | WebSocket bridge, TLS and the PROXY protocol to upstreams, live reload, discovery |
+| 0.5.0 | WebSocket bridge, TLS and the PROXY protocol to upstreams, live reload, draining, discovery, slow start, request ids (*shipped*) |
 
 ### Features
 
@@ -114,8 +122,8 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 | `std` | yes | `std` integration. Without it the crate needs only `alloc`. |
 | `client` | yes | the upstream side over net-io and http-net: connections, the pool, the forwarder, the health checker |
 | `serve` | yes | the serve-net service, `Proxy::serve`, and Tier 1 |
-| `tls` | no, from 0.5 | TLS to upstreams through tls-net |
-| `ws` | no, from 0.5 | the WebSocket bridge through ws-net |
+| `tls` | no (0.5) | TLS to upstreams through tls-net (aws-lc-rs as the crypto provider, Mozilla roots built in) |
+| `ws` | no (0.5) | the WebSocket bridge through ws-net; turns on `serve` |
 
 ---
 
@@ -177,7 +185,7 @@ Errors: `ProxyError::Config`; `ProxyError::Io` when the checker thread cannot st
 ```rust,ignore
 impl Proxy {
     pub fn handle(&self) -> ProxyHandle;
-    pub fn config(&self) -> &Config;
+    pub fn config(&self) -> Config;                                         // the current one (0.5: owned)
     pub fn service(&self) -> ProxyService;                                  // feature `serve`
     pub fn serve<A: ToSocketAddrs>(self, listen: A) -> Result<Running, ProxyError>; // feature `serve`
     pub fn forward(&self, route: usize, parts: RequestParts) -> Option<Forward>;
@@ -205,18 +213,19 @@ impl Running {
 
 ### `ProxyHandle`, `HealthSnapshot`, `ProxyStats`
 
-*Shipped (0.4, feature `client`).* Snapshots, read without locks except the connection counts (one short lock per endpoint).
+*Shipped (0.4, feature `client`; `is_eligible` and `ramp` 0.5).* Snapshots, read without locks except the connection counts (one short lock per endpoint). The live changes are in [Live changes](#live-changes).
 
 ```rust,ignore
 impl ProxyHandle {
     pub fn health(&self) -> HealthSnapshot;
     pub fn stats(&self) -> ProxyStats;
-    pub fn balancer(&self, pool: usize) -> Option<&Balancer>;
+    pub fn is_eligible(&self, pool: usize, id: EndpointId) -> bool;   // replaces 0.4's balancer()
 }
 pub struct HealthSnapshot { pub pools: Vec<PoolHealth> }
 pub struct PoolHealth { pub name: Box<str>, pub endpoints: Vec<EndpointHealth> }
 pub struct EndpointHealth { pub addr: EndpointAddr, pub state: EndpointState, pub eligible: bool,
-                            pub active: u32, pub open: u32, pub idle: u32, pub latency_ns: u64 }
+                            pub active: u32, pub open: u32, pub idle: u32, pub latency_ns: u64,
+                            pub ramp: u32 }   // slow-start share in percent, 100 when not ramping
 pub struct ProxyStats { pub exchanges: u64, pub succeeded: u64, pub failed: u64, pub retries: u64,
                         pub refused: u64, pub desyncs: u64 }
 ```
@@ -246,6 +255,10 @@ for pool in running.handle().health().pools {
 | `health_changed(pool, endpoint, from, to)` | an endpoint's health changed |
 | `refused(class)` | a request was refused before forwarding |
 | `desync(endpoint, leftover)` | an upstream left bytes after a complete response |
+| `response_outlier(route, bytes, mean)` | 0.5: a response far larger than the route's usual (see below) |
+| `discovery_failed(pool, why)` | 0.5: a discovery source failed, or gave nothing inside the allowlist; the pool keeps its endpoints |
+
+`response_outlier` reports, never blocks. Each route keeps a moving mean of its response sizes (weight 1/32); once a route has 100 responses, one over 8 times the mean and over 64 KiB is reported. It costs three relaxed atomic operations per exchange.
 
 `Finished` carries the route, pool, endpoint, status, failure class, attempts, bytes up and down, and the time it took.
 
@@ -272,10 +285,139 @@ let builder = proxy_net::ProxyBuilder::new().observer(Retries::default());
 - `call`: holds the first `Limits::request_buffer` bytes of the body, then forwards; when the body is complete, waits for the response head (with retries), then relays the body in parts of up to `Limits::relay_buffer`, called again only once the client took the last part.
 - A failure before any response byte answers with its status (`Retry-After: 1` with 503); after that, the client connection is closed.
 - The upstream's `Date` is dropped (serve-net writes its own), and a response with more than 64 fields is answered 502 (serve-net 0.8 writes at most 64).
+- 0.5: a request whose head arrived before a live change is routed again under the new configuration when its body is forwarded, with the route, loop, and request checks run again, so one request is never judged by two configurations.
+- 0.5, feature `ws`: a WebSocket upgrade on a route with `websocket(true)` goes to [the bridge](#the-websocket-bridge); on any other route an upgrade is refused.
 
 ### `ProxyError`
 
 *Shipped (0.4).* `Config(ConfigError)`, `Serve(serve_net::ServeError)` (feature `serve`), `Io(std::io::Error)`.
+
+---
+
+## Live changes
+
+### `reload`, `set_endpoints`, `drain_endpoint`
+
+*Shipped (0.5, feature `client`).*
+
+```rust,ignore
+impl ProxyHandle {
+    pub fn reload(&self, builder: ProxyBuilder) -> Result<(), ConfigError>;
+    pub fn set_endpoints(&self, pool: &str, endpoints: &[Endpoint]) -> Result<(), ConfigError>;
+    pub fn drain_endpoint(&self, pool: &str, endpoint: &EndpointAddr) -> bool;
+}
+```
+
+- `reload` checks the new configuration (asking discovery sources again), builds its running state beside the current one, and swaps it in. An endpoint in both (same pool name and address) keeps its health, its pooled connections, and its slow-start ramp; one that is gone takes nothing new and finishes what it has. On an error the running configuration is unchanged.
+- `set_endpoints` replaces one pool's endpoints the same way, without asking discovery. Errors: `UnknownPool`, or the new configuration's error.
+- `drain_endpoint` takes an endpoint out of rotation: it takes no new exchanges, finishes the ones in flight, and its idle connections close. It stays draining across reloads. `false` when there is no such endpoint.
+- The observer, the connector, and the counters stay across changes. A request in flight finishes on the configuration it started with.
+
+```rust,no_run
+let running = proxy_net::proxy("127.0.0.1:8080", ["127.0.0.1:3000"])?;
+let handle = running.handle();
+handle.set_endpoints("default", &[proxy_net::Endpoint::parse("127.0.0.1:3001")?])?;
+handle.reload(proxy_net::ProxyBuilder::new().pool("default", proxy_net::Pool::new(["127.0.0.1:3002"])))?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+### `Discovery`, `StaticDiscovery`, `DnsDiscovery`
+
+*Shipped (0.5, feature `client`).*
+
+```rust,ignore
+pub trait Discovery: Send + Sync + 'static {
+    fn endpoints(&self) -> Result<Vec<Endpoint>, DiscoveryError>;
+    fn refresh_every(&self) -> Option<Duration> { None }   // None: asked at build and reload only
+}
+pub struct StaticDiscovery;   // StaticDiscovery::new(Vec<Endpoint>)
+pub struct DnsDiscovery;      // DnsDiscovery::new(host, port, refresh): every address the name resolves to
+pub struct DiscoveryError;    // DiscoveryError::new(message), message()
+impl Pool {
+    pub fn discovery(self, source: impl Discovery) -> Pool;
+    pub fn discovery_allow(self, ranges: &[&str]) -> Pool;   // CIDR ranges
+}
+```
+
+- A pool with a discovery source may list no endpoints of its own. Its endpoints are what the source gives at build, and at each refresh from the health checker thread. A refresh that changes nothing changes nothing.
+- The allowlist (T-20): with ranges set, only addresses inside them are kept, and no host names (a name cannot be checked). Without ranges, every address is kept except loopback, link-local (where cloud metadata services live), unspecified, multicast, and broadcast; name those ranges to allow them.
+- A source that fails, or gives nothing inside the allowlist, leaves the pool as it was and is reported through `Observer::discovery_failed`. A pool never empties itself on a bad answer.
+
+```rust
+use std::time::Duration;
+use proxy_net::client::DnsDiscovery;
+let pool = proxy_net::Pool::new(Vec::<&str>::new())
+    .discovery(DnsDiscovery::new("app.internal", 8080, Duration::from_secs(10)))
+    .discovery_allow(&["10.0.0.0/8"]);
+# let _ = pool;
+```
+
+Errors: a range that does not parse refuses the build (`Inconsistent`).
+
+---
+
+## Upstream protocols
+
+### `ProxyProtocol`
+
+*Shipped (0.5).*
+
+```rust,ignore
+pub enum ProxyProtocol { Off, V1, V2 { authority: bool, crc: bool } }
+impl ProxyProtocol { pub fn v2() -> ProxyProtocol; pub fn is_on(self) -> bool; }
+impl Pool { pub fn proxy_protocol(self, version: ProxyProtocol) -> Pool; }
+```
+
+The header goes at the start of each upstream connection, written by net-io's encoders: the client's address and the listener's. `v2()` adds the request's `Host` as the authority TLV and a CRC32C. Health checks send a `LOCAL` (v2) or `UNKNOWN` (v1) header. With the header on, a connection is never reused, since it names one client.
+
+```rust
+use proxy_net::{Pool, ProxyProtocol};
+let pool = Pool::new(["10.0.0.1:80"]).proxy_protocol(ProxyProtocol::v2());
+# let _ = pool;
+```
+
+### `UpstreamTls`, `UpstreamRoots`, `TlsConnector`
+
+*Shipped (0.5; connecting needs feature `tls`).*
+
+```rust,ignore
+impl UpstreamTls {
+    pub fn new() -> UpstreamTls;                                        // public roots, SNI from each endpoint
+    pub fn roots_pem(self, pem: &[u8]) -> UpstreamTls;                  // trust only these roots
+    pub fn server_name(self, name: &str) -> UpstreamTls;                // one SNI and name for every endpoint
+    pub fn client_certificate(self, chain_pem: &[u8], key_pem: &[u8]) -> UpstreamTls;
+    pub fn roots(&self) -> &UpstreamRoots;
+    pub fn server_name_value(&self) -> Option<&str>;
+    pub fn client_certificate_value(&self) -> Option<(&[u8], &[u8])>;
+}
+pub enum UpstreamRoots { Public, Pem(Box<[u8]>) }
+impl Pool { pub fn tls(self, tls: UpstreamTls) -> Pool; }
+// proxy_net::client, feature `tls`
+impl TlsConnector { pub fn new(tls: &UpstreamTls) -> Result<TlsConnector, ConfigReason>; }
+```
+
+- The certificate is always verified: against the Mozilla roots, or only the PEM roots given. To pin, trust a private CA that signs nothing else; tls-net has no SPKI pins yet.
+- The name checked is `server_name` when set, otherwise the endpoint's host name, otherwise its address. ALPN offers `http/1.1`.
+- A pooled TLS connection is reused only when its probe says it is open with nothing waiting.
+- A pool with `tls` and no `tls` feature, roots that do not parse, or a client certificate that does not load refuse the build.
+
+```rust
+use proxy_net::{Pool, UpstreamTls};
+let pool = Pool::new(["api.internal:443"]).tls(UpstreamTls::new().server_name("api.internal"));
+# let _ = pool;
+```
+
+### The WebSocket bridge
+
+*Shipped (0.5, feature `ws`).* Turned on per route with `Route::websocket(true)`.
+
+- serve-net terminates the client's WebSocket; ws-net opens a new one to the upstream, offering the client's subprotocols and no extensions. Every message is parsed on one side and written again on the other, so no frame passes through as raw bytes.
+- An upgrade gets the same request checks as any request (path policy and methods) before anything is opened.
+- The client gets its 101 only after the upstream's genuine 101 with the accept key for the key the proxy sent (T-11). Anything else answers 502 and no tunnel opens.
+- The upstream request's fields are rewritten as for any request (forwarding headers, rules, `Host`), and the PROXY header is sent when the pool has one.
+- The subprotocol the upstream chose goes to the client. serve-net keeps these names for the life of the process, so the bridge accepts at most 64 distinct names; past that an upgrade answers 502.
+- A pool with `tls` is not bridged in 0.5 (502): the bridge reads and writes the upstream from two threads, and a TLS stream cannot be split.
+- serve-net cannot yet close a client's WebSocket from outside a callback, so an upstream close reaches the client at its next message, or when the tunnel idle timeout ends the connection.
 
 ---
 
@@ -300,7 +442,7 @@ pub trait UpstreamIo: Send + 'static {
 }
 ```
 
-`TcpConnector` connects through net-io (the system resolver for host names, happy eyeballs when a name has several addresses) with net-io's own phase timeouts out of the way, so every call's deadline decides; the minimum transfer rate is off, since an upstream may trickle a long response. `prelude` is sent first (the PROXY header from 0.5).
+`TcpConnector` connects through net-io (the system resolver for host names, happy eyeballs when a name has several addresses) with net-io's own phase timeouts out of the way, so every call's deadline decides; the minimum transfer rate is off, since an upstream may trickle a long response. `prelude` is sent first (the PROXY header, 0.5).
 
 ```rust
 use std::time::Instant;
@@ -350,7 +492,9 @@ assert_eq!(body, b"ok");
 ```rust,ignore
 pub struct RequestParts { pub method: Box<str>, pub target: Box<str>, pub host: Box<[u8]>,
                           pub fields: Vec<(Box<str>, Box<[u8]>)>, pub client: Option<SocketAddr>,
-                          pub https: bool, pub body: BodyFacts, pub key: Option<u64> }
+                          pub https: bool, pub body: BodyFacts, pub key: Option<u64>,
+                          pub peer: Option<SocketAddr>, pub hops: u8,          // 0.5, append mode
+                          pub request_id: Option<Box<[u8]>> }                  // 0.5
 impl Forward {
     pub fn push_body(&mut self, bytes: &[u8], last: bool) -> Result<(), Failure>;
     pub fn response(&mut self) -> Result<ResponseStart, Failure>;
@@ -388,6 +532,7 @@ impl ProxyBuilder {
     pub fn no_via(self) -> ProxyBuilder;
     pub fn frame_facts(self, on: bool) -> ProxyBuilder;   // 0.3.0
     pub fn hash_key(self, key: [u8; 16]) -> ProxyBuilder; // 0.4.0
+    pub fn request_id(self, name: &str) -> ProxyBuilder;  // 0.5.0
     pub fn check(&self) -> Result<(), ConfigError>;
     pub fn config(self) -> Result<Config, ConfigError>;
     // 0.4.0, feature `client`: build, observer, connector (see The running proxy)
@@ -406,6 +551,7 @@ impl ProxyBuilder {
 | `no_via` | no `Via`, no loop detection |
 | `hash_key` | the key consistent hashing uses for request keys; all zero by default, so every node agrees with no setting; set the same secret on every node to make the mapping unpredictable from outside |
 | `frame_facts` | add a `proxy-frame` field stating how the proxy framed each upstream request (`length=N`, `chunked`, or `none`, and the field count), so an upstream that reads it can detect a framing disagreement; off by default. A client's `proxy-frame` is always removed |
+| `request_id` | 0.5: the field that carries a request id. A client's value is kept when it is a token of 1 to 64 bytes; otherwise the proxy writes 32 hex characters, unique per process (not secret). Off by default |
 | `check` | `config` without consuming the builder |
 | `config` | checks everything and returns the validated [`Config`](#config) |
 
@@ -439,7 +585,7 @@ Errors: the first problem found, as a [`ConfigError`](#configerror) naming the p
 
 ### `Config`
 
-*Shipped.* The validated configuration. Immutable; from 0.5 a reload replaces it whole.
+*Shipped.* The validated configuration. Immutable; a reload (0.5) replaces it whole.
 
 ```rust,ignore
 impl Config {
@@ -454,6 +600,7 @@ impl Config {
     pub fn via(&self) -> Option<&str>;
     pub fn frame_facts(&self) -> bool;
     pub fn hash_key(&self) -> [u8; 16];
+    pub fn request_id(&self) -> Option<&str>;   // 0.5
 }
 ```
 
@@ -526,6 +673,8 @@ let config = ProxyBuilder::new()
 # let _ = config;
 # Ok::<(), proxy_net::ConfigError>(())
 ```
+
+`append_trusted` (0.5): when the inbound side walked trusted proxies to find the client, the last that many elements of the incoming `Forwarded` and `X-Forwarded-For` are kept and the socket peer is added; nothing a client wrote before them survives. A chain that does not parse, or a direct client, is replaced as in the default mode.
 
 Errors: `Inconsistent` when `append_trusted` or `by` is set with `off`, or `by` with `x_forwarded` (only `Forwarded` has `by=`); `Pseudonym` when an obfuscated name is not `_` followed by letters, digits, `.`, `_`, `-`.
 
@@ -610,7 +759,7 @@ assert_eq!(e.addr().port(), 8080);
 
 ### `Route`
 
-*Shipped (matching and validation); rewrites applied from 0.3; `websocket` from 0.5.*
+*Shipped (matching and validation); rewrites applied from 0.3; `websocket` bridged from 0.5.*
 
 ```rust,ignore
 impl Route {
@@ -733,8 +882,17 @@ impl Pool {
     pub fn retry(self, retry: Retry) -> Pool;
     pub fn timeouts(self, timeouts: Timeouts) -> Pool;
     pub fn limits(self, limits: PoolLimits) -> Pool;
-    // 0.5.0: proxy_protocol, tls, discovery
+    pub fn proxy_protocol(self, version: ProxyProtocol) -> Pool;   // 0.5.0
+    pub fn tls(self, tls: UpstreamTls) -> Pool;                    // 0.5.0
+    pub fn slow_start(self, ramp: Duration) -> Pool;               // 0.5.0
+    pub fn discovery(self, source: impl Discovery) -> Pool;        // 0.5.0, feature `client`
+    pub fn discovery_allow(self, ranges: &[&str]) -> Pool;         // 0.5.0
 }
+```
+
+`slow_start` (0.5): an endpoint that comes back from ejection or an unhealthy state, or that a live change adds to a running pool, takes a growing share of its turns over `ramp`: a tenth at first, all of them at the end. Round robin, least connections, and power of two choices honour it; consistent hashing does not (it would move keys). At most one hour; 0 (the default) is off.
+
+```rust,ignore
 ```
 
 Endpoint text is parsed when the configuration is built, so an error names the pool and the endpoint's position. A pool holds 1 to 4,096 endpoints, each address once.
@@ -749,11 +907,11 @@ let pool = Pool::new(["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"])
 # let _ = pool;
 ```
 
-Errors (on `Pool(name)` or `Endpoint { pool, index }`): `PoolName`, `NoEndpoints`, `DuplicateEndpoint`, `EndpointSyntax`, `Weight`, `Limit`, `HeaderName`, `PathPattern`, `HeaderValue`.
+Errors (on `Pool(name)` or `Endpoint { pool, index }`): `PoolName`, `NoEndpoints` (not raised for a pool with discovery), `DuplicateEndpoint`, `EndpointSyntax`, `Weight`, `Limit` (also `slow_start` over an hour), `HeaderName`, `PathPattern`, `HeaderValue`, `Inconsistent` (TLS settings, an allowlist range).
 
 ### `PoolConfig`
 
-*Shipped.* A checked pool: `name()`, `endpoints()`, `balance()`, `health()`, `outlier()`, `retry()`, `timeouts()`, `limits()`.
+*Shipped.* A checked pool: `name()`, `endpoints()`, `balance()`, `health()`, `outlier()`, `retry()`, `timeouts()`, `limits()`; 0.5: `proxy_protocol()`, `tls()`, `slow_start()`, `discovery_allow()`.
 
 ### `Balance`, `HashKey`
 
@@ -849,6 +1007,16 @@ let check = proxy_net::HealthCheck::http("/ready")
 | `idle_timeout` | 4 s | keep it below the endpoint's own keep-alive timeout |
 | `max_exchanges_per_connection` | 1,000 | then the connection is closed |
 | `fresh_for` | 1 s | a non-idempotent request only reuses a connection used this recently, so the keep-alive close race cannot lose it |
+
+### `Cidr`
+
+*Shipped (0.5).* An address range, parsed from `10.0.0.0/8` or `2001:db8::/32` (a bare address is one host), with `contains(ip)`. Bits past the prefix must be zero.
+
+```rust
+let range: proxy_net::Cidr = "10.0.0.0/8".parse()?;
+assert!(range.contains("10.1.2.3".parse()?));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ---
 
@@ -1270,27 +1438,14 @@ assert_eq!(e.to_string(), "no upstream is available (attempt 1)");
 
 ---
 
-## Planned items
+## Changes from the planned 0.5 shape
 
-The locked shape of what follows 0.4. Names and signatures here change only with a migration note.
+0.5 ships every planned item. Where the shipped shape differs from the one locked in 0.2:
 
-### 0.5.0: feature complete
-
-```rust,ignore
-impl Endpoint {
-    pub fn slow_start(..);                                         // moved from 0.4 (see dev/ROADMAP.md)
-}
-impl Pool {
-    pub fn proxy_protocol(self, version: ProxyProtocol) -> Pool;   // Off, V1, V2 { authority, alpn, unique_id, crc }
-    pub fn tls(self, tls: UpstreamTls) -> Pool;                    // roots, pinning, SNI, client certificates
-    pub fn discovery(self, source: impl Discovery) -> Pool;
-}
-impl ProxyHandle {
-    pub fn reload(&self, builder: ProxyBuilder) -> Result<(), ConfigError>;
-    pub fn set_endpoints(&self, pool: &str, endpoints: &[Endpoint]) -> Result<(), ConfigError>;
-    pub fn drain_endpoint(&self, pool: &str, endpoint: &EndpointAddr) -> bool;
-}
-pub trait Discovery: Send + Sync + 'static { fn endpoints(&self) -> Result<Vec<Endpoint>, DiscoveryError>; fn refresh_every(&self) -> Option<Duration>; }
-pub struct StaticDiscovery; pub struct DnsDiscovery;
-pub struct TlsConnector;
-```
+| Planned | Shipped | Why |
+|---|---|---|
+| `Endpoint::slow_start` | `Pool::slow_start(ramp)` | one ramp per pool is what deployments set, and it applies to endpoints that discovery adds |
+| `ProxyProtocol::V2 { authority, alpn, unique_id, crc }` | `V2 { authority, crc }` | the proxy has no ALPN or unique id to send for plain upstreams; the enum is `#[non_exhaustive]`, so they can join later |
+| `UpstreamTls` pinning | trust a private CA with `roots_pem` | tls-net has no SPKI pins on the client yet |
+| `ProxyHandle::balancer(pool) -> Option<&Balancer>` (0.4) | `is_eligible(pool, id)` | the balancer now lives in the swappable running state, so a reference to it cannot outlive a reload |
+| `Proxy::config() -> &Config` (0.4) | `Proxy::config() -> Config` | the same reason: the current configuration is a snapshot |

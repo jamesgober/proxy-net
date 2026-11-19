@@ -7,10 +7,12 @@
 //!
 //! ## Status
 //!
-//! `0.4.0` forwards real traffic. With the default features, `proxy_net::proxy`
+//! `0.5.0` is feature complete. With the default features, `proxy_net::proxy`
 //! puts a listener in front of a set of servers in one line, and
 //! `ProxyBuilder::build` starts a `Proxy` from pools, routes, and health
-//! checks. The decisions live in [`core`] (sans-IO, no `std` needed); the
+//! checks; its handle reloads the configuration, replaces endpoints, and
+//! drains them while it runs. TLS to upstreams (feature `tls`), the PROXY
+//! protocol, and the WebSocket bridge (feature `ws`) are in. The decisions live in [`core`] (sans-IO, no `std` needed); the
 //! `client` module (feature `client`) drives them against real connections,
 //! and `ProxyService` (feature `serve`) is the serve-net service. The full API,
 //! with the version each part ships in, is in `docs/API.md` in the
@@ -45,6 +47,8 @@
 //! | `serve` | yes | the serve-net service, `Proxy::serve`, and `proxy` (implies `client`) |
 //! | `client` | yes | the upstream side: connections, the pool, the forwarder, the health checker (implies `std`) |
 //! | `std` | yes | `std` integration; without it the crate needs only `alloc` (and 64-bit atomics) |
+//! | `tls` | no | TLS to upstreams through tls-net (implies `client`) |
+//! | `ws` | no | the WebSocket bridge through ws-net (implies `serve`) |
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![doc(html_root_url = "https://docs.rs/proxy-net")]
@@ -81,6 +85,9 @@ mod route;
 #[cfg(feature = "serve")]
 mod serve;
 mod syntax;
+mod upstream;
+#[cfg(feature = "ws")]
+mod ws;
 
 pub use config::{
     ByNode, Config, DEFAULT_PSEUDONYM, Forwarded, ForwardedStyle, Limits, MAX_ROUTES, ProxyBuilder,
@@ -94,6 +101,7 @@ pub use pool::{
 };
 pub use rewrite::{FORWARDING_SET, HeaderRule, HostHeader, PathCheck, PathPolicy};
 pub use route::Route;
+pub use upstream::{Cidr, ProxyProtocol, UpstreamRoots, UpstreamTls};
 
 #[cfg(feature = "client")]
 pub use observe::{Finished, NoObserver, Observer, ProxyStats};

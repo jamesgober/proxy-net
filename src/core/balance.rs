@@ -30,6 +30,10 @@ struct Member {
     /// Latency estimate in nanoseconds (EWMA with a weight of 1/8).
     ewma: AtomicU64,
     eligible: AtomicBool,
+    /// Share of the weight in percent (slow start), 100 when ramped up.
+    ramp: AtomicU32,
+    /// When the ramp started (`Tick` nanoseconds), 0 when none runs.
+    ramp_since: AtomicU64,
 }
 
 enum Policy {
@@ -152,6 +156,9 @@ fn is_prime(n: usize) -> bool {
 /// permutation in turn, `weight` slots per round, until the table is full.
 fn maglev(names: &[Vec<u8>], weights: &[u64]) -> Box<[u16]> {
     let n = names.len();
+    if n == 0 {
+        return Box::new([]);
+    }
     let mut m = (n * 100).max(MIN_TABLE);
     while !is_prime(m) {
         m += 1;
@@ -214,6 +221,8 @@ impl Balancer {
                 active: AtomicU32::new(0),
                 ewma: AtomicU64::new(0),
                 eligible: AtomicBool::new(false),
+                ramp: AtomicU32::new(100),
+                ramp_since: AtomicU64::new(0),
             })
             .collect();
         let policy = match pool.balance() {
@@ -351,6 +360,64 @@ impl Balancer {
         self.members[i].eligible.load(Ordering::Acquire) && !exclude.iter().any(|e| e.index() == i)
     }
 
+    /// True when a ramping endpoint takes this turn (it takes `ramp` percent
+    /// of them).
+    fn ramp_admits(&self, i: usize) -> bool {
+        let ramp = self.members[i].ramp.load(Ordering::Relaxed);
+        ramp >= 100 || (mix(self.seed ^ self.next()) % 100) < u64::from(ramp)
+    }
+
+    /// Starts a slow-start ramp for `id` at `now`: it takes a tenth of its
+    /// share, growing as [`update_ramps`](Balancer::update_ramps) runs.
+    pub fn start_ramp(&self, id: EndpointId, now: super::tick::Tick) {
+        if let Some(m) = self.members.get(id.index()) {
+            m.ramp.store(10, Ordering::Release);
+            m.ramp_since.store(now.0.max(1), Ordering::Release);
+        }
+    }
+
+    /// Moves every running ramp forward to `now` over `over`: from 10 to 100
+    /// percent, linearly. Returns true while any ramp is still running.
+    pub fn update_ramps(&self, now: super::tick::Tick, over: core::time::Duration) -> bool {
+        let span = u64::try_from(over.as_nanos()).unwrap_or(u64::MAX).max(1);
+        let mut running = false;
+        for m in self.members.iter() {
+            let since = m.ramp_since.load(Ordering::Acquire);
+            if since == 0 {
+                continue;
+            }
+            let elapsed = now.0.saturating_sub(since);
+            if elapsed >= span {
+                m.ramp.store(100, Ordering::Release);
+                m.ramp_since.store(0, Ordering::Release);
+            } else {
+                let pct = 10 + (90 * u128::from(elapsed) / u128::from(span)) as u32;
+                m.ramp.store(pct.min(100), Ordering::Release);
+                running = true;
+            }
+        }
+        running
+    }
+
+    /// Carries the ramp of endpoint `from` of `old` to endpoint `id` (a
+    /// reload that keeps the endpoint keeps its ramp).
+    #[cfg(feature = "client")]
+    pub(crate) fn adopt_ramp(&self, id: EndpointId, old: &Balancer, from: EndpointId) {
+        if let (Some(m), Some(o)) = (self.members.get(id.index()), old.members.get(from.index())) {
+            m.ramp
+                .store(o.ramp.load(Ordering::Acquire), Ordering::Release);
+            m.ramp_since
+                .store(o.ramp_since.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+
+    /// The slow-start share of `id`, in percent.
+    pub fn ramp(&self, id: EndpointId) -> u32 {
+        self.members
+            .get(id.index())
+            .map_or(100, |m| m.ramp.load(Ordering::Acquire))
+    }
+
     fn next(&self) -> u64 {
         self.counter.fetch_add(1, Ordering::Relaxed)
     }
@@ -414,20 +481,31 @@ impl Balancer {
         }
     }
 
-    /// True when `a` has fewer active requests for its weight than `b`.
+    /// True when `a` has fewer active requests for its weight (scaled by its
+    /// slow-start share) than `b`.
     fn fewer(&self, a: usize, b: usize) -> bool {
         let (ma, mb) = (&self.members[a], &self.members[b]);
-        u64::from(ma.active.load(Ordering::Relaxed)) * mb.weight
-            < u64::from(mb.active.load(Ordering::Relaxed)) * ma.weight
+        let wa = ma.weight * u64::from(ma.ramp.load(Ordering::Relaxed));
+        let wb = mb.weight * u64::from(mb.ramp.load(Ordering::Relaxed));
+        u64::from(ma.active.load(Ordering::Relaxed)) * wb
+            < u64::from(mb.active.load(Ordering::Relaxed)) * wa
     }
 
     fn round_robin(&self, schedule: &[u16], ok: &dyn Fn(usize) -> bool) -> Option<EndpointId> {
         let len = schedule.len() as u64;
         let start = self.next();
-        (0..len)
-            .map(|k| usize::from(schedule[((start + k) % len) as usize]))
-            .find(|&i| ok(i))
-            .map(|i| EndpointId(i as u16))
+        let mut fallback = None;
+        for k in 0..len {
+            let i = usize::from(schedule[((start + k) % len) as usize]);
+            if !ok(i) {
+                continue;
+            }
+            if self.ramp_admits(i) {
+                return Some(EndpointId(i as u16));
+            }
+            let _ = fallback.get_or_insert(i);
+        }
+        fallback.map(|i| EndpointId(i as u16))
     }
 
     /// The first usable endpoint from a position derived from `r`.
@@ -577,6 +655,29 @@ mod tests {
         }
         assert_eq!(&*schedule(&[2, 2]), &[0, 1]);
         assert_eq!(schedule(&[1000; 100]).len(), 100);
+    }
+
+    #[test]
+    fn test_slow_start_ramps_grow_the_share() {
+        let p = pool_of(Pool::new(addrs(2)));
+        let (b, _) = ready(&p);
+        let new = EndpointId(0);
+        let start = Tick(1_000);
+        b.start_ramp(new, start);
+        assert_eq!(b.ramp(new), 10);
+        let share = |b: &Balancer| (0..2000).filter(|_| b.pick(None, &[]) == Some(new)).count();
+        let early = share(&b);
+        assert!(early > 0 && early < 400, "{early}");
+        let over = core::time::Duration::from_secs(10);
+        assert!(b.update_ramps(start.after(over / 2), over));
+        assert_eq!(b.ramp(new), 55);
+        assert!(!b.update_ramps(start.after(over), over));
+        assert_eq!(b.ramp(new), 100);
+        let late = share(&b);
+        assert!((900..=1100).contains(&late), "{late}");
+        // A finished ramp stays finished.
+        assert!(!b.update_ramps(start.after(over * 2), over));
+        assert_eq!(b.ramp(new), 100);
     }
 
     #[test]

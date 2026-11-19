@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "proxy-net"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -55,6 +55,12 @@ std = []
 client = ["std", "dep:net-io", "dep:http-net"]
 # The inbound side: the serve-net service and `proxy_net::proxy`.
 serve = ["client", "dep:serve-net"]
+# TLS to upstreams through tls-net (rustls inside tls-net, the one crypto
+# dependency the portfolio accepts).
+tls = ["client", "dep:tls-net"]
+# The WebSocket bridge: serve-net terminates the client's WebSocket and
+# ws-net opens one to the upstream; messages are parsed and written again.
+ws = ["serve", "serve-net/ws", "dep:ws-net"]
 
 
 # DEPENDENCIES
@@ -69,6 +75,11 @@ http-net = { version = "0.10", default-features = false, optional = true }
 net-io = { version = "0.8.1", default-features = false, features = ["proxy"], optional = true }
 # The inbound engine.
 serve-net = { version = "0.8.2", default-features = false, features = ["http1"], optional = true }
+# TLS to upstreams. Its net-io seam is off: proxy-net drives the stream over
+# its own net-io connection.
+tls-net = { version = "0.10", default-features = false, features = ["aws-lc", "webpki-roots"], optional = true }
+# The upstream side of the WebSocket bridge.
+ws-net = { version = "0.10", default-features = false, features = ["std"], optional = true }
 
 
 # Model-checking the lock-free core (tests/loom.rs); only with

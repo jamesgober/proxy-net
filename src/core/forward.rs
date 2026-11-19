@@ -59,6 +59,9 @@ pub struct ForwardFacts<'a> {
     listener: Option<SocketAddr>,
     upstream_tls: bool,
     body: BodyFacts,
+    peer: Option<SocketAddr>,
+    hops: u8,
+    request_id: Option<&'a [u8]>,
 }
 
 /// The request body as the proxy will frame it upstream.
@@ -94,6 +97,9 @@ impl<'a> ForwardFacts<'a> {
             listener: None,
             upstream_tls: false,
             body: BodyFacts::None,
+            peer: None,
+            hops: 0,
+            request_id: None,
         }
     }
 
@@ -132,6 +138,24 @@ impl<'a> ForwardFacts<'a> {
     #[must_use]
     pub fn body(mut self, body: BodyFacts) -> ForwardFacts<'a> {
         self.body = body;
+        self
+    }
+
+    /// The trusted chain in front of this proxy: the socket peer and how many
+    /// proxies the inbound engine walked to find the client (0 for a direct
+    /// client). Used by `Forwarded::append_trusted`.
+    #[must_use]
+    pub fn chain(mut self, peer: Option<SocketAddr>, hops: u8) -> ForwardFacts<'a> {
+        self.peer = peer;
+        self.hops = hops;
+        self
+    }
+
+    /// The request id to write when the request has none (see
+    /// `ProxyBuilder::request_id`).
+    #[must_use]
+    pub fn request_id(mut self, id: Option<&'a [u8]>) -> ForwardFacts<'a> {
+        self.request_id = id;
         self
     }
 
@@ -334,7 +358,15 @@ pub fn request_fields(
         out.push(name, value);
     }
     apply_rules(route.request_rules(), out);
-    push_forwarding(facts, config, out);
+    if let (Some(name), Some(id)) = (config.request_id(), facts.request_id) {
+        let kept = out.get(name).is_some_and(|v| {
+            (1..=64).contains(&v.len()) && v.iter().all(|&b| crate::syntax::is_tchar(b))
+        });
+        if !kept {
+            out.set(name, id);
+        }
+    }
+    push_forwarding(fields, facts, config, out);
     if let Some(p) = config.via() {
         let mut v = Vec::with_capacity(4 + p.len());
         v.extend_from_slice(b"1.1 ");
@@ -373,10 +405,60 @@ fn push_host(facts: &ForwardFacts<'_>, route: &CompiledRoute, out: &mut FieldLis
     }
 }
 
-fn push_forwarding(facts: &ForwardFacts<'_>, config: &Config, out: &mut FieldList) {
+/// The elements of the incoming chain added by trusted proxies: the last
+/// `hops` of `Forwarded` (re-serialized) and of `X-Forwarded-For`. `None`
+/// when either does not parse (the chain is then replaced, as when it is not
+/// trusted).
+fn trusted_chain(fields: &[(&str, &[u8])], hops: u8) -> Option<(Vec<Vec<u8>>, Vec<IpAddr>)> {
+    let lines = |name: &str| -> Vec<&[u8]> {
+        fields
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| *v)
+            .collect()
+    };
+    let limits = parse_net::Limits::DEFAULT;
+    let fwd = lines("forwarded");
+    let mut elements = Vec::new();
+    if !fwd.is_empty() {
+        let parsed = parse_net::forwarded::parse(&fwd, &limits).ok()?;
+        let all: Vec<_> = parsed.iter().collect();
+        for e in all.iter().skip(all.len().saturating_sub(usize::from(hops))) {
+            let mut v = Vec::new();
+            parse_net::forwarded::write_element(e, &mut v).ok()?;
+            elements.push(v);
+        }
+    }
+    let xff = lines("x-forwarded-for");
+    let mut addrs = Vec::new();
+    if !xff.is_empty() {
+        let parsed = parse_net::forwarded::parse_x_forwarded_for(&xff, &limits).ok()?;
+        let all: Vec<IpAddr> = parsed.iter().map(|(ip, _)| ip).collect();
+        addrs.extend_from_slice(&all[all.len().saturating_sub(usize::from(hops))..]);
+    }
+    Some((elements, addrs))
+}
+
+fn push_forwarding(
+    fields: &[(&str, &[u8])],
+    facts: &ForwardFacts<'_>,
+    config: &Config,
+    out: &mut FieldList,
+) {
     let forwarded = config.forwarded();
     let style = forwarded.style();
     let proto = if facts.https { "https" } else { "http" };
+    // Append mode: keep what trusted proxies added and add this hop, whose
+    // client is the socket peer.
+    let chain = if forwarded.appends_trusted() && facts.hops > 0 {
+        trusted_chain(fields, facts.hops)
+    } else {
+        None
+    };
+    let this_client = match (&chain, facts.peer) {
+        (Some(_), Some(peer)) => Some(peer),
+        _ => facts.client,
+    };
     if matches!(style, ForwardedStyle::Both | ForwardedStyle::Standard) {
         let host = parse_net::parse_host_port(facts.host).ok();
         let by = match forwarded.by_node() {
@@ -387,7 +469,7 @@ fn push_forwarding(facts: &ForwardFacts<'_>, config: &Config, out: &mut FieldLis
             _ => None,
         };
         let element = Element {
-            for_: Some(match facts.client {
+            for_: Some(match this_client {
                 Some(c) => Node::Addr(c.ip(), None),
                 None => Node::Unknown(None),
             }),
@@ -400,9 +482,38 @@ fn push_forwarding(facts: &ForwardFacts<'_>, config: &Config, out: &mut FieldLis
             }),
         };
         let mut value = Vec::new();
+        if let Some((elements, _)) = &chain {
+            let elements: &Vec<Vec<u8>> = elements;
+            let mut first = true;
+            // A chain the inbound engine trusted but no Forwarded line came
+            // with (PROXY protocol, X-Forwarded-For only): start from the client.
+            if elements.is_empty() {
+                if let Some(c) = facts.client {
+                    let e = Element {
+                        for_: Some(Node::Addr(c.ip(), None)),
+                        by: None,
+                        host: None,
+                        proto: None,
+                    };
+                    let _ = parse_net::forwarded::write_element(&e, &mut value);
+                    first = false;
+                }
+            }
+            for e in elements {
+                if !first {
+                    value.extend_from_slice(b", ");
+                }
+                value.extend_from_slice(e);
+                first = false;
+            }
+            if !first {
+                value.extend_from_slice(b", ");
+            }
+        }
+        let start = value.len();
         if parse_net::forwarded::write_element(&element, &mut value).is_err() {
+            value.truncate(start);
             // The host did not fit the grammar: write the element without it.
-            value.clear();
             let element = Element {
                 host: None,
                 ..element
@@ -412,8 +523,23 @@ fn push_forwarding(facts: &ForwardFacts<'_>, config: &Config, out: &mut FieldLis
         out.push("forwarded", &value);
     }
     if matches!(style, ForwardedStyle::Both | ForwardedStyle::XForwarded) {
-        if let Some(c) = facts.client {
-            out.push("x-forwarded-for", alloc::format!("{}", c.ip()).as_bytes());
+        match (&chain, facts.peer) {
+            (Some((_, addrs)), Some(peer)) => {
+                let mut list: Vec<alloc::string::String> =
+                    addrs.iter().map(|a| alloc::format!("{a}")).collect();
+                if list.is_empty() {
+                    if let Some(c) = facts.client {
+                        list.push(alloc::format!("{}", c.ip()));
+                    }
+                }
+                list.push(alloc::format!("{}", peer.ip()));
+                out.push("x-forwarded-for", list.join(", ").as_bytes());
+            }
+            _ => {
+                if let Some(c) = facts.client {
+                    out.push("x-forwarded-for", alloc::format!("{}", c.ip()).as_bytes());
+                }
+            }
         }
         out.push("x-forwarded-proto", proto.as_bytes());
         if !facts.host.is_empty() {

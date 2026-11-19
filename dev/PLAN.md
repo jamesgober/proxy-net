@@ -2,13 +2,13 @@
 
 > The design, strategy, and decision record for `proxy-net`. A living document: every design decision, idea, or open question about proxy-net is written here or in [`ROADMAP.md`](./ROADMAP.md) before it is acted on.
 >
-> **Status:** `0.4.0`, forwarding (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
+> **Status:** `0.5.0`, feature complete (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
 
 ---
 
 ## 1. Purpose
 
-A reverse proxy and load balancer for services on serve-net. It takes requests that serve-net has admitted (with the connection gate and every inbound limit in place), picks an upstream endpoint from a pool, and forwards the request and the response. It completes the "every option" goal: run direct, run behind a proxy, or be the proxy. In WASP it is the forwarding service behind the proxy, gateway, and load-balancer roles.
+A reverse proxy and load balancer for services on serve-net. It takes requests that serve-net has admitted (with the connection gate and every inbound limit in place), picks an upstream endpoint from a pool, and forwards the request and the response. It completes the "every option" goal: run direct, run behind a proxy, or be the proxy. In a larger deployment it is the forwarding service behind the proxy, gateway, and load-balancer roles.
 
 ## 2. Scope
 
@@ -29,9 +29,12 @@ A reverse proxy and load balancer for services on serve-net. It takes requests t
 - `core`: sans-IO, `alloc` only. The route table (0.2); balancers, health state, retry accounting, head rewriting, path safety, loop detection, and the exchange state machine (0.3). It takes facts and time (`Tick`) and returns decisions; it reads no clock and opens no socket.
 - `client` (feature, 0.4): the upstream side over net-io: connector, connection pool sharded per thread, the connection driving http-net's `ClientConn`, the active health checker.
 - `serve` (feature, 0.4): `ProxyService`, a serve-net `HttpService`; Tier 1 `proxy`.
-- `ws`, `tls` (features, 0.5).
+- `tls` (feature, 0.5): `TlsConnector`, TLS over net-io connections through tls-net.
+- `ws` (feature, 0.5): the WebSocket bridge; serve-net terminates the client's WebSocket and ws-net opens one to the upstream.
 
-Threads: serve-net's workers run the exchanges; one health-checker thread per proxy; one discovery thread when a pool refreshes; one reader thread per bridged WebSocket on the blocking driver.
+The running state (`Runtime`) sits behind one `RwLock<Arc<_>>`: a request takes a clone of the `Arc` once, and a live change builds a new runtime beside the old one and swaps it in. Requests in flight finish on the runtime they started with.
+
+Threads: serve-net's workers run the exchanges; one health-checker thread per proxy, which also refreshes discovery and moves slow-start ramps; one reader thread per bridged WebSocket on the blocking driver.
 
 ## 4. Threats
 
@@ -55,8 +58,8 @@ Threads: serve-net's workers run the exchanges; one health-checker thread per pr
 | T-16 | memory exhaustion | budgets on upstream heads; bounded relay buffers |
 | T-17 | proxy loops | `Via` pseudonym loop detection, 508 |
 | T-18 | topology leaks | error bodies name a class only; response rules can remove `Server` |
-| T-19 | interception toward remote upstreams | TLS with verification or pinning |
-| T-20 | a compromised discovery source | discovery is configuration; an optional CIDR allowlist |
+| T-19 | interception toward remote upstreams | TLS with verification against public roots or a private CA (pinning through a private CA until tls-net has SPKI pins, G-13) |
+| T-20 | a compromised discovery source | discovery is configuration; a CIDR allowlist; without one, loopback, link-local (cloud metadata), unspecified, multicast, and broadcast addresses are refused (D-053) |
 | T-21 | trailer injection | forbidden trailer fields dropped; trailers never merged into the head |
 | T-22 | cache poisoning in front | proxy-net does not cache; rules can remove unkeyed headers |
 
@@ -87,11 +90,15 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | G-4 | serve-net | at most 64 reply fields | larger responses answered 502 and reported |
 | G-5 | serve-net | a streamed reply is always chunked; no length on `HEAD` replies | known lengths sent chunked |
 | G-6 | serve-net | no raw-connection hand-off after 101 | WebSocket bridged; other upgrades refused |
-| G-7 | serve-net | built on http-net 0.9 and net-io 0.7 | two copies in the build; no type crosses |
+| G-7 | serve-net | built on http-net 0.9, net-io 0.7, and (with `ws`) ws-net 0.9 | two copies in the build; no type crosses (the bridge hands serve-net its own message type) |
 | G-8 | http-net | the planned `quirks` facts are not shipped | proxy-net's own agreement checks |
 | G-9 | http-net | `Request::forward_from` takes only an http-net head | proxy-net builds the request from a field list |
 | G-10 | net-io | `encode_v1` allocates per header | accepted: one per new upstream connection |
 | G-11 | net-io | no non-blocking outbound connect kept on a reactor worker | blocking workers required |
+| G-12 | serve-net | the running server does not report the address it bound | `Proxy::serve` binds, then records the address with a configuration swap (D-044) |
+| G-13 | tls-net | no SPKI pinning on the client | pin by trusting only a private CA (`UpstreamTls::roots_pem`) |
+| G-14 | serve-net | a `WsSender` cannot close the client's WebSocket | an upstream close is passed on at the client's next message; the tunnel idle timeout ends the rest |
+| G-15 | tls-net | a `TlsStream` cannot be read on one thread and written on another | `wss` upstreams are not bridged (D-048) |
 
 ## 7. Ideas (one new defence per version)
 
@@ -100,7 +107,7 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | I-1 | 0.3 | If an upstream can see how the proxy framed a request, a framing disagreement becomes detectable there. | Optional `Proxy-Frame` field with the framing facts the proxy wrote; an http-net upstream compares. | about 40 bytes and 30 ns per request [est.]; off by default |
 | I-2 | 0.4 | Bytes left after a complete upstream response mean the upstream is desynchronised. | Close, report `desync`, and count it as an outlier failure. | none on the good path |
 | I-3 | 0.4 | The keep-alive close race loses only requests sent on connections idle long enough to be closed upstream. | Non-idempotent requests reuse only connections used within `fresh_for`. | an extra connect for some POSTs |
-| I-4 | 0.5 | A response far larger than usual for a route signals exfiltration or a confused upstream. | Per-route EWMA of response sizes; report outliers to the observer. | one atomic update per exchange |
+| I-4 | 0.5 | A response far larger than usual for a route signals exfiltration or a confused upstream. | Per-route EWMA of response sizes (weight 1/32); after 100 responses, one over 8 times the mean and over 64 KiB goes to `Observer::response_outlier`. Reported, never blocked. | three relaxed atomic operations per exchange (about 2 ns [est.]); 16 bytes per route |
 | I-5 | 0.6 | A gradient concurrency limit finds the overload knee better than a fixed cap. | Experimental adaptive limit per pool, compared under a load sweep. | a few atomics per exchange |
 | I-6 | 0.7 | Differential checking catches what unit tests miss. | Fuzzed requests through the proxy to two upstream parsers; compare what each saw. | test time only |
 
@@ -158,3 +165,18 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | D-040 | 2026-11-19 | Model checks run under `--cfg proxy_net_loom`, with loom only as a cfg-gated dependency | the atomics come through one module (`core::atomic`), so loom swaps them without touching the code; a normal build never sees loom |
 | D-041 | 2026-11-19 | `Proxy::serve` and `proxy` start serve-net with 256 blocking workers and the body limit raised to `max_request_body` | the service blocks on the upstream (G-1), and serve-net's default 1 MiB body limit would cut uploads short |
 | D-042 | 2026-11-19 | Slow start moves from 0.4 to 0.5 | round robin walks a schedule built once; changing weights over time means rebuilding it, which the 0.5 reload work does anyway. It is off by default, so no behaviour changes in the meantime |
+| D-043 | 2026-11-19 | A pool that sends the PROXY protocol never reuses a connection | the header names one client; a reused connection would attribute the next client's request to the first |
+| D-044 | 2026-11-19 | The listener address is recorded after `serve` binds, through a configuration swap | serve-net does not report the bound address (G-12), and port 0 is only known after the bind; the swap keeps health and connections |
+| D-045 | 2026-11-19 | `reload` asks discovery again; `swap` (used by `set_endpoints`, discovery refreshes, and the listener address) does not | a refresh that re-queried discovery would undo the result it was applying |
+| D-046 | 2026-11-19 | An endpoint present before and after a live change (same pool name, same address) keeps its health, its pooled connections, and its slow-start ramp; one that is gone takes nothing new and finishes what it has | a reload must not re-admit an ejected endpoint or drop warm connections |
+| D-047 | 2026-11-19 | A request whose head arrived under an older configuration is routed again under the current one (the configuration generation sits in serve-net's per-request word) | the head and the body of one request must not be judged by two configurations |
+| D-048 | 2026-11-19 | The WebSocket bridge refuses `wss` upstreams in 0.5 (502); see ROADMAP | the bridge reads the upstream on one thread and writes it on another, and a TLS stream cannot be split (G-15); a single-threaded pump needs the reactor path (G-1) |
+| D-049 | 2026-11-19 | Subprotocol names the bridge answers with are interned, at most 64 distinct names per process; beyond that the upgrade fails with 502 | serve-net takes the chosen name as `&'static str`; the cap bounds the memory an upstream can make the proxy keep |
+| D-050 | 2026-11-19 | A TLS upstream connection is reused only when the probe reports it open with nothing waiting | buffered records (a close notify, a key update) would otherwise be read as the next response |
+| D-051 | 2026-11-19 | Slow start is a per-endpoint share, 10% rising linearly to 100% over the ramp, applied as an admit test on the endpoint's turns; it replaces D-042's plan to rebuild the schedule | no schedule rebuild and no lock on the pick path, one atomic load per pick of a ramping endpoint, and it works for every policy; ramps start when an endpoint returns from ejection or an unhealthy state, and when a live change adds it to a running pool |
+| D-052 | 2026-11-19 | `request_id` keeps a client's value when it is a token of 1 to 64 bytes and otherwise writes 32 hex characters from a per-process keyed counter | upstream logs can join on a caller's id, and a value that could carry an injection or flood logs is replaced; the id is unique per process, not secret |
+| D-053 | 2026-11-19 | Discovery without an allowlist refuses loopback, link-local, unspecified, multicast, and broadcast addresses; with one, only addresses inside it (and no names) are kept; a refresh that leaves nothing keeps the last set and is reported | a discovery source that is spoofed or misconfigured must not point the proxy at a metadata service or at itself; a pool never empties itself on a bad refresh |
+| D-054 | 2026-11-19 | Append mode keeps the last `hops` elements of the incoming `Forwarded` and `X-Forwarded-For` (the hops the inbound side trusted) and adds the socket peer; a chain that does not parse is replaced as in the default mode | the trusted proxies' entries are kept and nothing a client wrote before them survives |
+| D-055 | 2026-11-19 | An address range with bits set past its prefix (`10.1.0.0/8`) is refused | it is almost always a typo for a narrower range, and accepting it would allow the wider one |
+| D-056 | 2026-11-19 | A WebSocket upgrade runs the same request checks as any request (path policy, methods) before the bridge opens anything, and a request routed again after a live change runs the route, loop, and request checks again under the new configuration; a request already being forwarded is never routed again | an upgrade route must not be a way around T-7, and a stricter configuration must apply to every request it routes |
+| D-057 | 2026-11-19 | cargo-deny allows CDLA-Permissive-2.0 for webpki-roots only, and bans other TLS stacks (`openssl`, `openssl-sys`, `native-tls`), async runtimes (`tokio`, `async-std`), and the archived `rustls-pemfile` | webpki-roots is the Mozilla root bundle (data) that tls-net uses, under a permissive data license; a per-crate exception keeps that license out of everything else. The bans hold tls-net's line here: one TLS stack, no async runtime, no unmaintained PEM parser |
