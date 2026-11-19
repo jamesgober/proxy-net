@@ -61,6 +61,7 @@
 
 ## v0.7.0 - Hardening
 - [ ] 24-hour fuzz campaign per target, the full attack suite, the multi-node test, a 24-hour soak, idea I-6, `docs/SECURITY.md`.
+- [ ] When serve-net ships its fix for G-16 (a 0.8.x patch), move to it and re-enable the two ignored pipelined bridge tests (D-066), in the first proxy-net version after it ships.
 - [ ] Memory per active exchange measured under load with the soak (the 1.0 target is under 20 KiB); 0.6 measured allocations per request, not the heap an exchange holds.
 - [ ] Idea I-5 on sockets: a load sweep against a real endpoint with a knee; if it agrees with the simulation, an opt-in adaptive limit per pool (D-063).
 

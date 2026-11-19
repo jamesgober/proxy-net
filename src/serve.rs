@@ -28,6 +28,9 @@ const MAX_REPLY_FIELDS: usize = 64;
 /// The blocking worker threads `Proxy::serve` and `proxy` start.
 const WORKERS: u16 = 256;
 
+/// The default read buffer of a client connection.
+const DEFAULT_READ_BUFFER: u32 = 16 * 1024;
+
 /// Listens on `listen` and forwards every request to `upstreams`: one pool,
 /// round robin, passive health, the default limits and timeouts, and both
 /// styles of forwarding headers.
@@ -152,11 +155,18 @@ impl Proxy {
         if let Some(n) = inbound.max_connections {
             limits = limits.max_connections(n);
         }
+        let read = serve_net::net_io::SizeClass::new(inbound.read_buffer)
+            .ok()
+            .filter(|c| *c <= serve_net::net_io::SizeClass::LARGE)
+            .ok_or(ProxyError::Inbound(
+                "read_buffer must be a power of two from 1 KiB to 64 KiB",
+            ))?;
         let transport = serve_net::net_io::Limits::builder()
             .max_per_source(
                 inbound.max_per_source,
                 serve_net::net_io::PrefixPolicy::DEFAULT,
             )
+            .read_class(read, serve_net::net_io::SizeClass::LARGE)
             .build()
             .map_err(|_| ProxyError::Inbound("max_per_source must be 1 or more"))?;
         if inbound.workers == 0 {
@@ -200,6 +210,7 @@ pub struct Inbound {
     workers: u16,
     max_per_source: u32,
     max_connections: Option<u32>,
+    read_buffer: u32,
 }
 
 impl Default for Inbound {
@@ -217,7 +228,23 @@ impl Inbound {
             workers: WORKERS,
             max_per_source: 16,
             max_connections: None,
+            read_buffer: DEFAULT_READ_BUFFER,
         }
+    }
+
+    /// The read buffer each client connection holds, in bytes: a power of
+    /// two from 1 KiB to 64 KiB. A request body arrives at most this much
+    /// per read.
+    #[must_use]
+    pub const fn read_buffer(mut self, bytes: u32) -> Inbound {
+        self.read_buffer = bytes;
+        self
+    }
+
+    /// The read buffer set.
+    #[must_use]
+    pub const fn read_buffer_value(&self) -> u32 {
+        self.read_buffer
     }
 
     /// Blocking workers: the most client connections open at once.
