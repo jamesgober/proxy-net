@@ -2,7 +2,7 @@
 
 > The design, strategy, and decision record for `proxy-net`. A living document: every design decision, idea, or open question about proxy-net is written here or in [`ROADMAP.md`](./ROADMAP.md) before it is acted on.
 >
-> **Status:** `0.5.0`, feature complete (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
+> **Status:** `0.6.0`, optimisation (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
 
 ---
 
@@ -30,9 +30,11 @@ A reverse proxy and load balancer for services on serve-net. It takes requests t
 - `client` (feature, 0.4): the upstream side over net-io: connector, connection pool sharded per thread, the connection driving http-net's `ClientConn`, the active health checker.
 - `serve` (feature, 0.4): `ProxyService`, a serve-net `HttpService`; Tier 1 `proxy`.
 - `tls` (feature, 0.5): `TlsConnector`, TLS over net-io connections through tls-net.
-- `ws` (feature, 0.5): the WebSocket bridge; serve-net terminates the client's WebSocket and ws-net opens one to the upstream.
+- `ws` (feature, 0.5): the WebSocket bridge; serve-net terminates the client's WebSocket and ws-net opens one to the upstream. Toward a pool with TLS (0.6), tls-net's `ClientSession` sits under the bridge's lock and the reading thread hands it ciphertext from its own socket clone (D-058).
 
 The running state (`Runtime`) sits behind one `RwLock<Arc<_>>`: a request takes a clone of the `Arc` once, and a live change builds a new runtime beside the old one and swaps it in. Requests in flight finish on the runtime they started with.
+
+Buffers: each worker thread keeps up to three field lists and three byte buffers (each at most 16 KiB) between exchanges, so a warm worker does not allocate them again (D-059). A proxied keep-alive `GET` makes 10 heap allocations, 7 of them http-net's `Request` (G-17); `tests/alloc.rs` fails above 12.
 
 Threads: serve-net's workers run the exchanges; one health-checker thread per proxy, which also refreshes discovery and moves slow-start ramps; one reader thread per bridged WebSocket on the blocking driver.
 
@@ -98,7 +100,10 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | G-12 | serve-net | the running server does not report the address it bound | `Proxy::serve` binds, then records the address with a configuration swap (D-044) |
 | G-13 | tls-net | no SPKI pinning on the client | pin by trusting only a private CA (`UpstreamTls::roots_pem`) |
 | G-14 | serve-net | a `WsSender` cannot close the client's WebSocket | an upstream close is passed on at the client's next message; the tunnel idle timeout ends the rest |
-| G-15 | tls-net | a `TlsStream` cannot be read on one thread and written on another | `wss` upstreams are not bridged (D-048) |
+| G-15 | tls-net | a `TlsStream` cannot be read on one thread and written on another | closed in proxy-net in 0.6: the bridge drives tls-net's `ClientSession` itself (D-058) |
+| G-16 | serve-net | on Windows with the blocking driver, messages a `WsSender` queues while the worker is busy with the same connection can wait for the client's next frame or the ping interval (200 pipelined echoes: the last 6 to 160 held 30 s; Linux delivers all) | none in proxy-net; the pipelined bridge tests skip Windows; reported for serve-net |
+| G-17 | http-net | a `Request` cannot be reused: a target `String` and a field buffer per request | accepted: 7 of the 10 allocations per request, counted in `tests/alloc.rs` |
+| G-18 | serve-net | the client-side WebSocket does not negotiate permessage-deflate | the offer stays narrowed (D-064) |
 
 ## 7. Ideas (one new defence per version)
 
@@ -108,7 +113,7 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | I-2 | 0.4 | Bytes left after a complete upstream response mean the upstream is desynchronised. | Close, report `desync`, and count it as an outlier failure. | none on the good path |
 | I-3 | 0.4 | The keep-alive close race loses only requests sent on connections idle long enough to be closed upstream. | Non-idempotent requests reuse only connections used within `fresh_for`. | an extra connect for some POSTs |
 | I-4 | 0.5 | A response far larger than usual for a route signals exfiltration or a confused upstream. | Per-route EWMA of response sizes (weight 1/32); after 100 responses, one over 8 times the mean and over 64 KiB goes to `Observer::response_outlier`. Reported, never blocked. | three relaxed atomic operations per exchange (about 2 ns [est.]); 16 bytes per route |
-| I-5 | 0.6 | A gradient concurrency limit finds the overload knee better than a fixed cap. | Experimental adaptive limit per pool, compared under a load sweep. | a few atomics per exchange |
+| I-5 | 0.6 | A gradient concurrency limit finds the overload knee better than a fixed cap. | `core::adaptive` (crate-internal), compared with fixed caps by a simulated load sweep against an endpoint that queues past 32 concurrent requests. Result: no capacity lost at any load; p99 30 to 53% below the default cap of 256 from 2 to 8 times the knee, 67% below when the endpoint halves its speed under overload; still about 4 times what a cap set exactly at the knee gives (D-063). | one compare-and-swap to admit; a few relaxed atomics per sample, skipped under contention; about 60 bytes per endpoint |
 | I-6 | 0.7 | Differential checking catches what unit tests miss. | Fuzzed requests through the proxy to two upstream parsers; compare what each saw. | test time only |
 
 ## 8. Open decisions
@@ -117,7 +122,7 @@ Each gap has a fallback here, so proxy-net never waits on it.
 |---|---|---|
 | OD-1 | Approval of the design lock (`docs/API.md`) | Needs James: merging the 0.2 pull request is the approval. |
 | OD-2 | When to publish to crates.io for the first time | Needs James. Recommendation: publish 0.2.0 so the name is held and docs.rs shows the locked API; it holds configuration code only. |
-| OD-3 | permessage-deflate through the WebSocket bridge | Decide at 0.6 with numbers: decompress and recompress, or pass compressed payloads when both sides agree on parameters. Until then the offer is narrowed so neither side negotiates it. |
+| OD-3 | permessage-deflate through the WebSocket bridge | Decided in 0.6 (D-064): the offer stays narrowed. |
 
 ## 9. Decision log
 
@@ -180,3 +185,12 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | D-055 | 2026-11-19 | An address range with bits set past its prefix (`10.1.0.0/8`) is refused | it is almost always a typo for a narrower range, and accepting it would allow the wider one |
 | D-056 | 2026-11-19 | A WebSocket upgrade runs the same request checks as any request (path policy, methods) before the bridge opens anything, and a request routed again after a live change runs the route, loop, and request checks again under the new configuration; a request already being forwarded is never routed again | an upgrade route must not be a way around T-7, and a stricter configuration must apply to every request it routes |
 | D-057 | 2026-11-19 | cargo-deny allows CDLA-Permissive-2.0 for webpki-roots only, and bans other TLS stacks (`openssl`, `openssl-sys`, `native-tls`), async runtimes (`tokio`, `async-std`), and the archived `rustls-pemfile` | webpki-roots is the Mozilla root bundle (data) that tls-net uses, under a permissive data license; a per-crate exception keeps that license out of everything else. The bans hold tls-net's line here: one TLS stack, no async runtime, no unmaintained PEM parser |
+| D-058 | 2026-11-19 | `wss` upstreams are bridged: tls-net's `ClientSession` sits under the same lock as the upstream WebSocket state, the reading thread hands it ciphertext from its own clone of the socket, and every write to the socket happens under the lock; a send the session holds until the rest of a post-handshake message arrives waits for the reading thread within the write timeout (supersedes D-048) | records leave in the order they were sealed, so no second TLS stream or split is needed; tls-net's session does no I/O of its own (G-15). Cost: one lock per message, as for plain upstreams, and one copy of each record's plaintext |
+| D-059 | 2026-11-19 | Each worker thread keeps up to three field lists and three byte buffers between exchanges, freeing any that grew past 16 KiB; the rewriting functions read the client's fields in place and write values into the field list directly; `RequestParts::fields` is a `FieldList` and `Finished` borrows | 42 allocations (3.1 KB) per proxied GET became 10 (0.6 KB). Memory: at most about 100 KB per worker held, typically a few KB. Security: a kept buffer is cleared, and its old bytes are past its length, where safe code cannot read them, as with memory the allocator reuses |
+| D-060 | 2026-11-19 | The endpoint connection pool's lock covers only its list and counts: the reuse probe and any close happen after it is released, a close happens before its place is freed, and a release wakes only when someone waits | the probe and the futex wake under the lock serialised every worker on one endpoint (about 60,000 requests per second on Linux at any concurrency); after, 409,000 at 64 connections. The cap still holds: a socket is closed before its place is counted free |
+| D-061 | 2026-11-19 | `Proxy::serve_with(listen, Inbound)` sets workers, the per-source connection cap, and a connection cap; the per-source cap stays 16 by default | 16 per source (net-io's blocking default) keeps one address from holding every worker, which matters on the blocking driver; behind a load balancer every client shares a few addresses and the cap must be raised, which was not possible before. Benchmarks raise it to the connection cap (224 of 256), as other proxies have no such cap by default |
+| D-062 | 2026-11-19 | Benchmarks use proxy-net's own standard-library load generator and origin (`benches/compare.rs`, closed loop, keep-alive); the comparison with nginx, HAProxy, Envoy, and Pingora runs in a workflow on a hosted Linux runner | one tool for every target and no third-party dependency; a hosted runner is noisy, but every target meets the same load, origin, and machine, and nothing has to be installed on a developer's machine |
+| D-063 | 2026-11-19 | Idea I-5 stays an experiment in 0.6: `core::adaptive` with its simulation, not used by pools. The variant kept takes its floor as the lowest window average of the last 32 windows, with a half-limit drain probe in the last one; earlier variants are recorded: a long moving average as the floor lost 27% of capacity at 8 times the knee; the lowest average with no expiry kept p99 at 1.25 ms but collapsed to its minimum (2,000/s against 16,000/s) when the endpoint slowed down; a period minimum without a probe followed the queue up and gained nothing | the kept variant never loses capacity and cuts p99 by a third to two thirds under overload, but it is a simulation result; before pools use it, a socket-level sweep against a real endpoint with a knee must agree (0.7, ROADMAP) |
+| D-064 | 2026-11-19 | OD-3: permessage-deflate stays off through the bridge. Passing compressed payloads through is ruled out; decompressing and recompressing is possible later as an option per route, once serve-net negotiates it with clients (G-18) | pass-through would carry messages the proxy cannot check (UTF-8, message size, a decompression bomb) to the other side, against the rule that every message is parsed and written again. Recompressing costs, measured with compress-lib 1.1 (level 1, no context takeover): 6.7 us per 1 KiB message and 52 us per 16 KiB (150 to 340 MB/s per core), and about 331 KiB of compressor state per direction (0.7 MB per tunnel both ways) |
+| D-065 | 2026-11-19 | The reactor path moves to the first version after serve-net G-1 and net-io G-11 close; on 2026-11-19 both are open (serve-net 0.8.2 and net-io 0.8.1 are the newest) | a hard external dependency, as the roadmap set out at 0.4; the `wss` part of 0.6 did not need it (D-058) |
+| D-066 | 2026-11-19 | The bridge tests that pipeline 200 messages skip Windows, naming G-16 | the loss is in serve-net's Windows driver; Linux and macOS run them |

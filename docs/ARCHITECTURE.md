@@ -16,7 +16,7 @@
 
 > How proxy-net is built: the layers, where state lives, which threads run,
 > how one request moves through the proxy, and how a live change replaces
-> the running state without dropping a request. Version `0.5.0`.
+> the running state without dropping a request. Version `0.6.0`.
 
 ## Layers
 
@@ -58,7 +58,8 @@ A request takes one read lock to clone the `Arc<Runtime>` and works on that runt
 
 ## Threads
 
-- **serve-net workers** run the exchanges. They are blocking workers: the service waits on the upstream inside serve-net's call until serve-net can park a streamed reply (serve-net gap G-1). `Proxy::serve` starts 256.
+- **serve-net workers** run the exchanges. They are blocking workers: the service waits on the upstream inside serve-net's call until serve-net can park a streamed reply (serve-net gap G-1). `Proxy::serve` starts 256; `Proxy::serve_with` takes another number, and the per-source cap, through `Inbound`.
+- **Each worker keeps a few buffers between exchanges**: up to three field lists and three byte buffers, each at most 16 KiB, for the client's fields, the upstream request, the bytes sent, the response's fields, and the relay buffer. A warm worker allocates none of them again (10 allocations remain per request, 7 of them http-net's `Request`).
 - **One health checker thread per proxy.** It sleeps until the next job and then runs it: an active check, the end of an ejection, closing idle connections past their limit, moving slow-start ramps, or refreshing a discovery source. It follows the current runtime, so it picks up live changes on its own.
 - **One pump thread per bridged WebSocket**, reading the upstream and sending to the client.
 
@@ -89,6 +90,8 @@ client ◀─ws─── serve-net ◀── WsSender ◀─────── p
 ```
 
 On an upgrade, the service opens the upstream connection first and sends a new handshake (the client's subprotocols offered, no extensions, the request's fields rewritten as for any request). Only when the upstream answers a genuine 101 with the accept key for the key the proxy sent does the service ask serve-net to answer the client's 101. After that, each message is parsed on one side and written again on the other: client messages go through `BridgeService::message` to the upstream connection, and the pump thread reads the upstream and sends each message to the client. No frame passes through as raw bytes.
+
+Toward a pool with TLS (`wss`, 0.6) the TLS session belongs to neither thread. tls-net's `ClientSession` does no I/O of its own, so it sits under the same lock as the upstream WebSocket state. The pump thread reads ciphertext from its own clone of the socket without the lock, then hands it to the session under the lock; every write to the socket also happens under the lock, so records leave in the order they were sealed. When the session cannot seal until the rest of a message from the upstream arrives, the sending side waits for the pump thread, within the write timeout.
 
 ## Why it is shaped this way
 

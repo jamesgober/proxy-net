@@ -52,14 +52,17 @@
 - [x] Tests: live changes, PROXY protocol, request ids, the bridge (T-7 and T-11), TLS settings; fuzz `forwarded_append`.
 - Moved to 0.6, with the reason in PLAN D-048: `wss` upstreams through the bridge. It needs one thread to read and write the TLS stream, which is the reactor path 0.6 builds (or a split from tls-net, G-15). Plain `ws` upstreams are bridged now; a `wss` upstream answers 502, so nothing passes unencrypted by mistake.
 
-## v0.6.0 - Optimisation
-- [ ] Benchmarks against nginx, HAProxy, Envoy, and Pingora; counting-allocator proofs; `docs/PERFORMANCE.md`.
-- [ ] The reactor path once serve-net G-1 and net-io G-11 have closed (see PLAN section 6). If they have not, the reactor path moves to the first version after they close; this is a hard external dependency, not a deferral by choice.
-- [ ] Idea I-5 as an experiment; decide OD-3.
-- [ ] `wss` upstreams through the WebSocket bridge (moved from 0.5, D-048).
+## v0.6.0 - Optimisation (2026-11-19)
+- [x] Benchmarks against nginx, HAProxy, Envoy, and Pingora (`benches/compare`, the Bench workflow, D-062); counting-allocator proofs (`tests/alloc.rs`: 42 allocations per request down to 10, bound 12); `docs/PERFORMANCE.md`.
+- [x] Optimisation the benchmarks pointed to: buffers kept per worker (D-059), the connection pool's lock without system calls (D-060), and `Inbound` for the per-source cap that closed load-balancer traffic (D-061).
+- [x] Idea I-5 as an experiment (D-063); OD-3 decided (D-064).
+- [x] `wss` upstreams through the WebSocket bridge (moved from 0.5, D-048; built without the reactor, D-058).
+- Moved, with the reason in PLAN D-065: the reactor path. serve-net G-1 and net-io G-11 are still open (serve-net 0.8.2 and net-io 0.8.1 are the newest on 2026-11-19); it comes in the first version after both close. This is a hard external dependency, not a deferral by choice.
 
 ## v0.7.0 - Hardening
 - [ ] 24-hour fuzz campaign per target, the full attack suite, the multi-node test, a 24-hour soak, idea I-6, `docs/SECURITY.md`.
+- [ ] Memory per active exchange measured under load with the soak (the 1.0 target is under 20 KiB); 0.6 measured allocations per request, not the heap an exchange holds.
+- [ ] Idea I-5 on sockets: a load sweep against a real endpoint with a knee; if it agrees with the simulation, an opt-in adaptive limit per pool (D-063).
 
 ## v0.8.0 - Alpha
 - [ ] A gateway deployment uses proxy-net for its proxy and load-balancer roles end to end; `docs/OPERATIONS.md`, `docs/PLATFORM-NOTES.md`.

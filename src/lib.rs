@@ -7,7 +7,9 @@
 //!
 //! ## Status
 //!
-//! `0.5.0` is feature complete. With the default features, `proxy_net::proxy`
+//! `0.6.0`: every feature planned for 1.0 is in, `wss` upstreams included,
+//! and the request path is measured against other proxies (`docs/PERFORMANCE.md`).
+//! With the default features, `proxy_net::proxy`
 //! puts a listener in front of a set of servers in one line, and
 //! `ProxyBuilder::build` starts a `Proxy` from pools, routes, and health
 //! checks; its handle reloads the configuration, replaces endpoints, and

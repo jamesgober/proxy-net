@@ -13,6 +13,60 @@
 
 ---
 
+## [0.6.0] - 2026-11-19
+
+Optimisation: the request path measured against other proxies and made
+faster where the measurements pointed.
+
+### Added
+
+- `wss` upstreams through the WebSocket bridge: a WebSocket route to a pool
+  with TLS is bridged, with the certificate verified before the upgrade is
+  sent. tls-net's session is shared by the bridge's two threads under one
+  lock.
+- `Proxy::serve_with` and `Inbound`: workers, the per-source connection cap,
+  and a connection cap for the client side. `ProxyError::Inbound` for a zero
+  setting.
+- `docs/PERFORMANCE.md`: proxy-net against nginx, HAProxy, and Envoy,
+  allocations per request, the core's hot paths, permessage-deflate costs,
+  and the adaptive-concurrency experiment.
+- `benches/compare.rs` (a standard-library load generator and origin),
+  `benches/compare/` (nginx, HAProxy, Envoy, and Pingora set up in front of
+  the same origin), and the Bench workflow; `benches/core.rs` for route
+  matching, endpoint picks, and head rewriting.
+- `tests/alloc.rs`: allocations per proxied request (at most 12) and none in
+  route matching, counted with a global allocator.
+- Tests for `wss`: messages both ways (one larger than a TLS record), both
+  directions at once, an upstream pushing to a silent client, and upstreams
+  with an untrusted certificate or another name getting no upgrade.
+
+### Changed
+
+- A proxied keep-alive `GET` makes 10 heap allocations instead of 42: each
+  worker keeps a few buffers between exchanges, and head rewriting reads the
+  client's fields in place and writes values straight into the field list.
+- The upstream connection pool no longer makes system calls under its lock;
+  at 64 connections on Linux throughput rose from about 64,000 to 409,000
+  requests per second.
+- Route matching looks only at the routes that can match the request's
+  host: 39 ns instead of 86 ns for 32 routes.
+- The health checker no longer copies the configuration on every tick when
+  no pool has discovery.
+- `RequestParts::fields` is a `FieldList`.
+- `Finished` borrows: `Finished<'a>` with `pool: &str` and
+  `endpoint: Option<&EndpointAddr>`.
+- With the `tls` feature, a pool's TLS settings are loaded even when a custom
+  connector is set (the bridge uses them).
+
+### Known gaps
+
+- serve-net 0.8 on Windows can hold messages queued for a WebSocket client
+  until its next ping when the client is sending at the same time; Linux
+  delivers them. The pipelined bridge tests skip Windows.
+- The reactor path waits for serve-net and net-io (see the roadmap).
+
+---
+
 ## [0.5.0] - 2026-11-19
 
 Feature complete: every feature planned for 1.0 is in.
@@ -211,7 +265,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/proxy-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/proxy-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/proxy-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/proxy-net/compare/v0.2.0...v0.3.0
