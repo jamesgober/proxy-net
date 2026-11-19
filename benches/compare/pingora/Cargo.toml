@@ -1,0 +1,13 @@
+# Pingora in front of the bench origin (127.0.0.1:9000), on 127.0.0.1:8084.
+# Built only by the bench workflow; not part of proxy-net.
+[package]
+name = "pingora-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+pingora = { version = "0.4", features = ["proxy"] }
+async-trait = "0.1"
