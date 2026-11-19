@@ -53,6 +53,12 @@ required-features = ["serve"]
 name = "core"
 harness = false
 
+# The long soak (see the file's header); `--minutes` sets its length.
+[[bench]]
+name = "soak"
+harness = false
+required-features = ["serve"]
+
 
 # FEATURE FLAGS
 # #################################
