@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "proxy-net"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Reverse proxy for Rust services on serve-net: upstream pools, health checks, load balancing, header rewriting, and forwarding with the connection gate and limits in place."
+description = "Reverse proxy and load balancer for services on serve-net: upstream pools, health checks, balancing policies, re-serialized forwarding, and forwarding headers rebuilt from the real client."
 
 # Keywords (5 max)
 keywords = ["proxy", "reverse-proxy", "load-balancer", "http", "gateway"]
@@ -25,9 +25,11 @@ keywords = ["proxy", "reverse-proxy", "load-balancer", "http", "gateway"]
 categories = ["network-programming", "web-programming"]
 
 # Links
-homepage      = "https://github.com/jamesgober/proxy-net"
 repository    = "https://github.com/jamesgober/proxy-net"
 documentation = "https://docs.rs/proxy-net"
+
+# Not shipped in the package
+exclude = ["fuzz/", "dev/", ".github/"]
 
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
@@ -44,7 +46,10 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = []
+default = ["std"]
+# Integration with the standard library. Without it the crate needs only
+# `alloc` (the configuration types and the sans-IO core).
+std = []
 
 
 # DEPENDENCIES
