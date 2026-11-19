@@ -175,10 +175,7 @@ fn test_upgrades_get_the_path_checks() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "serve-net 0.8 on Windows can hold queued client messages until its next ping (G-16)"
-)]
+#[ignore = "serve-net 0.8 can hold messages queued for a client that is also sending until its next ping (G-16); run by hand"]
 fn test_pipelined_messages_all_come_back() {
     // Every message goes out before any echo is read, so echoes are queued
     // for the client while its own messages still arrive.

@@ -46,8 +46,11 @@ that machine and say little about any one of them alone.
 | HAProxy, 64 conn | 147,465 | 409 us | 976 us | 1.83 ms |
 | Envoy, 64 conn | 62,274 | 908 us | 1.77 ms | 2.50 ms |
 
-No request failed on any target. Pingora is set up by the same workflow and
-joins the table once its build passes there.
+No request failed on any target. A second run of the same code, on a runner
+about three times slower (31,077 requests per second direct on one
+connection), put proxy-net at 94% of nginx on one connection and 80% and 75%
+at 16 and 64 connections, and at about twice Envoy throughout. Pingora is
+set up by the same workflow and joins the table once its build passes there.
 
 What the table says:
 

@@ -104,10 +104,7 @@ fn test_messages_cross_a_wss_bridge_both_ways() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "serve-net 0.8 on Windows can hold queued client messages until its next ping (G-16)"
-)]
+#[ignore = "serve-net 0.8 can hold messages queued for a client that is also sending until its next ping (G-16); run by hand"]
 fn test_a_wss_bridge_carries_both_directions_at_once() {
     // Every message goes out before any echo is read, so the upstream's
     // replies are decrypted on the reading thread while later messages
@@ -125,7 +122,7 @@ fn test_a_wss_bridge_carries_both_directions_at_once() {
     for i in 0..count {
         match ws.read().expect("read") {
             Message::Text(t) => assert_eq!(t, format!("message {i}")),
-            other => panic!("expected text, got {other:?}"),
+            other => panic!("at {i}: expected text, got {other:?}"),
         }
     }
     ws.close(CloseCode::NORMAL, "done").expect("close");

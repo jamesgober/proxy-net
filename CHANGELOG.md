@@ -36,9 +36,10 @@ faster where the measurements pointed.
   matching, endpoint picks, and head rewriting.
 - `tests/alloc.rs`: allocations per proxied request (at most 12) and none in
   route matching, counted with a global allocator.
-- Tests for `wss`: messages both ways (one larger than a TLS record), both
-  directions at once, an upstream pushing to a silent client, and upstreams
-  with an untrusted certificate or another name getting no upgrade.
+- Tests for `wss`: messages both ways (one larger than a TLS record), an
+  upstream pushing to a silent client, and upstreams with an untrusted
+  certificate or another name getting no upgrade; both directions at once
+  is run by hand (see the known gaps).
 
 ### Changed
 
@@ -60,9 +61,10 @@ faster where the measurements pointed.
 
 ### Known gaps
 
-- serve-net 0.8 on Windows can hold messages queued for a WebSocket client
-  until its next ping when the client is sending at the same time; Linux
-  delivers them. The pipelined bridge tests skip Windows.
+- serve-net 0.8 can hold messages queued for a WebSocket client until its
+  next ping when the client is sending at the same time (most runs on
+  Windows, often on a loaded Linux machine). The two pipelined bridge tests
+  are ignored and run by hand.
 - The reactor path waits for serve-net and net-io (see the roadmap).
 
 ---
