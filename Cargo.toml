@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "proxy-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -55,13 +55,15 @@ std = []
 # DEPENDENCIES
 # #################################
 [dependencies]
-# None yet. Planned dependencies and the reason for each are listed in
-# dev/PLAN.md; each is added with the first code that needs it.
+# Field grammar: list parsing (Connection, Via) and Forwarded writing. 0.7
+# is the version http-net 0.10 pins, so the two agree when http-net joins.
+parse-net = { version = "0.7", default-features = false, features = ["alloc"] }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
+proptest = "1"
 
 
 # RELEASE PROFILE

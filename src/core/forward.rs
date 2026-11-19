@@ -1,0 +1,829 @@
+//! Head rewriting: what an upstream request and a client response carry.
+//!
+//! The request side, in order: hop-by-hop fields removed (the fixed set and
+//! every field `Connection` names), the forwarding set removed, `Host`,
+//! `Content-Length`, and `Expect: 100-continue` removed (the proxy writes the
+//! framing itself), the route's rules applied, then `Host`, the forwarding
+//! fields, and `Via` added. Because the proxy's own fields are added last, a
+//! `Connection` option cannot remove them.
+
+use alloc::vec::Vec;
+use core::net::{IpAddr, SocketAddr};
+
+use parse_net::forwarded::{Element, Node, NodePort, Proto};
+
+use super::class::{ErrorClass, RefusalKind};
+use super::fields::FieldList;
+use super::route::{CompiledRoute, PathRewrite};
+use crate::config::{ByNode, Config, ForwardedStyle};
+use crate::endpoint::{Endpoint, EndpointAddr};
+use crate::rewrite::{HeaderRule, HostHeader};
+
+/// Hop-by-hop fields (RFC 9110 7.6.1) and the framing the proxy writes
+/// itself.
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "transfer-encoding",
+    "upgrade",
+    "trailer",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "content-length",
+];
+
+/// The field of defence idea I-1; never accepted from a client.
+pub const FRAME_FIELD: &str = "proxy-frame";
+
+/// What the proxy knows about a request beyond its fields.
+///
+/// ```
+/// use proxy_net::core::ForwardFacts;
+/// let endpoint = proxy_net::Endpoint::parse("10.0.0.1:8080")?;
+/// let facts = ForwardFacts::new(b"GET", b"/a?b", b"example.com", &endpoint)
+///     .client("192.0.2.7:51000".parse().ok())
+///     .https(true);
+/// # let _ = facts;
+/// # Ok::<(), proxy_net::ConfigError>(())
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct ForwardFacts<'a> {
+    method: &'a [u8],
+    target: &'a [u8],
+    host: &'a [u8],
+    endpoint: &'a Endpoint,
+    client: Option<SocketAddr>,
+    https: bool,
+    listener: Option<SocketAddr>,
+    upstream_tls: bool,
+    body: BodyFacts,
+}
+
+/// The request body as the proxy will frame it upstream.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BodyFacts {
+    /// No body.
+    #[default]
+    None,
+    /// A body of this length.
+    Length(u64),
+    /// A body of unknown length, sent chunked.
+    Chunked,
+}
+
+impl<'a> ForwardFacts<'a> {
+    /// The facts of a request with `method`, `target` (path and query as
+    /// received), and `host` (the `Host` value), going to `endpoint`. The
+    /// client is unknown, the scheme plain, the body empty, until set.
+    pub fn new(
+        method: &'a [u8],
+        target: &'a [u8],
+        host: &'a [u8],
+        endpoint: &'a Endpoint,
+    ) -> ForwardFacts<'a> {
+        ForwardFacts {
+            method,
+            target,
+            host,
+            endpoint,
+            client: None,
+            https: false,
+            listener: None,
+            upstream_tls: false,
+            body: BodyFacts::None,
+        }
+    }
+
+    /// The client address serve-net resolved (after any trusted proxy in
+    /// front), or `None` when it is unknown.
+    #[must_use]
+    pub fn client(mut self, client: Option<SocketAddr>) -> ForwardFacts<'a> {
+        self.client = client;
+        self
+    }
+
+    /// The client reached the proxy over TLS (directly or through a trusted
+    /// front end that said so).
+    #[must_use]
+    pub fn https(mut self, https: bool) -> ForwardFacts<'a> {
+        self.https = https;
+        self
+    }
+
+    /// The listener address, for `by=` with [`ByNode::Listener`].
+    #[must_use]
+    pub fn listener(mut self, listener: Option<SocketAddr>) -> ForwardFacts<'a> {
+        self.listener = listener;
+        self
+    }
+
+    /// The upstream connection uses TLS (decides the default port of `Host`
+    /// for [`HostHeader::Endpoint`]).
+    #[must_use]
+    pub fn upstream_tls(mut self, tls: bool) -> ForwardFacts<'a> {
+        self.upstream_tls = tls;
+        self
+    }
+
+    /// How the body will be framed upstream.
+    #[must_use]
+    pub fn body(mut self, body: BodyFacts) -> ForwardFacts<'a> {
+        self.body = body;
+        self
+    }
+
+    /// The request method.
+    pub fn method(&self) -> &'a [u8] {
+        self.method
+    }
+
+    /// The request target as received.
+    pub fn target(&self) -> &'a [u8] {
+        self.target
+    }
+}
+
+/// True when the `Via` values name `pseudonym` as a received-by (RFC 9110
+/// 7.6.3: `protocol received-by [comment]`, comma-separated, any case).
+///
+/// ```
+/// use proxy_net::core::detect_loop;
+/// assert!(detect_loop([&b"1.1 cdn, 1.1 Edge-1 (proxy-net)"[..]], "edge-1"));
+/// assert!(!detect_loop([&b"1.1 edge-10"[..]], "edge-1"));
+/// ```
+pub fn detect_loop<'v, I>(via_values: I, pseudonym: &str) -> bool
+where
+    I: IntoIterator<Item = &'v [u8]>,
+{
+    via_values.into_iter().any(|value| {
+        elements(value).any(|element| {
+            let mut parts = element
+                .split(|b| *b == b' ' || *b == b'\t')
+                .filter(|p| !p.is_empty());
+            let _protocol = parts.next();
+            parts
+                .next()
+                .is_some_and(|by| by.eq_ignore_ascii_case(pseudonym.as_bytes()))
+        })
+    })
+}
+
+/// The elements of a comma-separated list value, through parse-net; a value
+/// that is not a valid list is split at every comma (only used for matching,
+/// never written).
+fn elements(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let parsed: Vec<&[u8]> = match parse_net::list(value) {
+        Ok(list) => list.iter().collect(),
+        Err(_) => value
+            .split(|b| *b == b',')
+            .map(trim)
+            .filter(|e| !e.is_empty())
+            .collect(),
+    };
+    parsed.into_iter()
+}
+
+fn trim(s: &[u8]) -> &[u8] {
+    let s = match s.iter().position(|b| *b != b' ' && *b != b'\t') {
+        Some(i) => &s[i..],
+        None => return &[],
+    };
+    match s.iter().rposition(|b| *b != b' ' && *b != b'\t') {
+        Some(i) => &s[..=i],
+        None => &[],
+    }
+}
+
+/// The tokens every `Connection` field names, lowercase-compared later.
+fn connection_options<'a>(fields: &[(&'a str, &'a [u8])]) -> Result<Vec<&'a [u8]>, ErrorClass> {
+    let mut out = Vec::new();
+    for (name, value) in fields {
+        if name.eq_ignore_ascii_case("connection") {
+            let list = parse_net::list(value)
+                .map_err(|_| ErrorClass::Refused(RefusalKind::InvalidField))?;
+            out.extend(list.iter());
+        }
+    }
+    Ok(out)
+}
+
+fn dropped(name: &str, options: &[&[u8]]) -> bool {
+    HOP_BY_HOP.iter().any(|h| h.eq_ignore_ascii_case(name))
+        || options
+            .iter()
+            .any(|o| o.eq_ignore_ascii_case(name.as_bytes()))
+}
+
+fn apply_rules(rules: &[HeaderRule], out: &mut FieldList) {
+    for rule in rules {
+        match rule {
+            HeaderRule::Set(n, v) => out.set(n, v.as_bytes()),
+            HeaderRule::Add(n, v) => out.push(n, v.as_bytes()),
+            HeaderRule::Remove(n) => out.remove(n),
+        }
+    }
+}
+
+/// Writes the upstream request's target (the path rewritten by the route,
+/// then the query unchanged) into `out`.
+///
+/// ```
+/// use proxy_net::core::{rewrite_target, PathRewrite};
+/// let mut out = Vec::new();
+/// rewrite_target(b"/v1/users?id=7", &PathRewrite::Strip("/v1".into()), &mut out);
+/// assert_eq!(out, b"/users?id=7");
+/// rewrite_target(b"/v1", &PathRewrite::Strip("/v1".into()), &mut out);
+/// assert_eq!(out, b"/");
+/// rewrite_target(b"/old/a", &PathRewrite::Replace("/old".into(), "/new".into()), &mut out);
+/// assert_eq!(out, b"/new/a");
+/// ```
+pub fn rewrite_target(target: &[u8], rewrite: &PathRewrite, out: &mut Vec<u8>) {
+    out.clear();
+    let (path, query) = match target.iter().position(|&b| b == b'?') {
+        Some(q) => (&target[..q], &target[q..]),
+        None => (target, &b""[..]),
+    };
+    let (prefix, replacement): (&[u8], &[u8]) = match rewrite {
+        PathRewrite::Strip(p) => (p.as_bytes(), b""),
+        PathRewrite::Replace(from, to) => (from.as_bytes(), to.as_bytes()),
+        _ => (b"", b""),
+    };
+    match path.strip_prefix(prefix) {
+        Some(rest) if !prefix.is_empty() => {
+            let replacement = replacement.strip_suffix(b"/").unwrap_or(replacement);
+            out.extend_from_slice(replacement);
+            if !rest.starts_with(b"/") {
+                out.push(b'/');
+            }
+            out.extend_from_slice(rest);
+        }
+        _ => out.extend_from_slice(path),
+    }
+    out.extend_from_slice(query);
+}
+
+/// The fields of the request sent upstream (see the module documentation
+/// for the order), and its target in `target`.
+///
+/// ```
+/// use proxy_net::core::{request_fields, FieldList, ForwardFacts};
+/// use proxy_net::{Pool, ProxyBuilder};
+///
+/// let config = ProxyBuilder::new().pool("app", Pool::new(["10.0.0.1:80"])).config()?;
+/// let route = config.routes().get(0).expect("route");
+/// let endpoint = &config.pool("app").expect("pool").endpoints()[0];
+/// let incoming = [
+///     ("Host", &b"example.com"[..]),
+///     ("X-Forwarded-For", b"127.0.0.1"),
+///     ("Connection", b"keep-alive, x-secret"),
+///     ("X-Secret", b"s"),
+///     ("Accept", b"*/*"),
+/// ];
+/// let facts = ForwardFacts::new(b"GET", b"/", b"example.com", endpoint)
+///     .client("192.0.2.7:51000".parse().ok());
+/// let (mut out, mut target) = (FieldList::new(), Vec::new());
+/// request_fields(&incoming, &facts, route, &config, &mut out, &mut target).expect("forward");
+/// let names: Vec<&str> = out.iter().map(|(n, _)| n).collect();
+/// assert_eq!(names, ["host", "accept", "forwarded", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "via"]);
+/// assert_eq!(out.get("x-forwarded-for"), Some(&b"192.0.2.7"[..]));
+/// assert_eq!(out.get("forwarded"), Some(&b"for=192.0.2.7;proto=http;host=example.com"[..]));
+/// # Ok::<(), proxy_net::ConfigError>(())
+/// ```
+///
+/// # Errors
+///
+/// `Loop` when `Via` names this proxy; `Refused(InvalidField)` when a
+/// `Connection` value is not a list.
+pub fn request_fields(
+    fields: &[(&str, &[u8])],
+    facts: &ForwardFacts<'_>,
+    route: &CompiledRoute,
+    config: &Config,
+    out: &mut FieldList,
+    target: &mut Vec<u8>,
+) -> Result<(), ErrorClass> {
+    out.clear();
+    if let Some(p) = config.via() {
+        let via = fields
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("via"))
+            .map(|(_, v)| *v);
+        if detect_loop(via, p) {
+            return Err(ErrorClass::Loop);
+        }
+    }
+    let options = connection_options(fields)?;
+    push_host(facts, route, out);
+    for (name, value) in fields {
+        let stripped = config
+            .stripped_headers()
+            .any(|s| s.eq_ignore_ascii_case(name));
+        let expect_continue = name.eq_ignore_ascii_case("expect")
+            && trim(value).eq_ignore_ascii_case(b"100-continue");
+        if dropped(name, &options)
+            || stripped
+            || expect_continue
+            || name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case(FRAME_FIELD)
+        {
+            continue;
+        }
+        out.push(name, value);
+    }
+    apply_rules(route.request_rules(), out);
+    push_forwarding(facts, config, out);
+    if let Some(p) = config.via() {
+        let mut v = Vec::with_capacity(4 + p.len());
+        v.extend_from_slice(b"1.1 ");
+        v.extend_from_slice(p.as_bytes());
+        out.push("via", &v);
+    }
+    if config.frame_facts() {
+        push_frame_facts(facts, out);
+    }
+    rewrite_target(facts.target, route.rewrite(), target);
+    Ok(())
+}
+
+fn push_host(facts: &ForwardFacts<'_>, route: &CompiledRoute, out: &mut FieldList) {
+    match route.host_header() {
+        HostHeader::Fixed(h) => out.push("host", h.as_bytes()),
+        HostHeader::Endpoint => {
+            let default = if facts.upstream_tls { 443 } else { 80 };
+            let e = facts.endpoint;
+            let port = e.addr().port();
+            let mut v: Vec<u8> = Vec::new();
+            match (e.server_name_value(), e.addr()) {
+                (Some(name), _) => v.extend_from_slice(name.as_bytes()),
+                (None, EndpointAddr::Ip(a)) => match a.ip() {
+                    IpAddr::V4(ip) => v.extend_from_slice(alloc::format!("{ip}").as_bytes()),
+                    IpAddr::V6(ip) => v.extend_from_slice(alloc::format!("[{ip}]").as_bytes()),
+                },
+                (None, EndpointAddr::Name { host, .. }) => v.extend_from_slice(host.as_bytes()),
+            }
+            if port != default {
+                v.extend_from_slice(alloc::format!(":{port}").as_bytes());
+            }
+            out.push("host", &v);
+        }
+        _ => out.push("host", facts.host),
+    }
+}
+
+fn push_forwarding(facts: &ForwardFacts<'_>, config: &Config, out: &mut FieldList) {
+    let forwarded = config.forwarded();
+    let style = forwarded.style();
+    let proto = if facts.https { "https" } else { "http" };
+    if matches!(style, ForwardedStyle::Both | ForwardedStyle::Standard) {
+        let host = parse_net::parse_host_port(facts.host).ok();
+        let by = match forwarded.by_node() {
+            ByNode::Listener => facts
+                .listener
+                .map(|l| Node::Addr(l.ip(), Some(NodePort::Number(l.port())))),
+            ByNode::Obfuscated(name) => Some(Node::Obfuscated(name.as_bytes(), None)),
+            _ => None,
+        };
+        let element = Element {
+            for_: Some(match facts.client {
+                Some(c) => Node::Addr(c.ip(), None),
+                None => Node::Unknown(None),
+            }),
+            by,
+            host,
+            proto: Some(if facts.https {
+                Proto::Https
+            } else {
+                Proto::Http
+            }),
+        };
+        let mut value = Vec::new();
+        if parse_net::forwarded::write_element(&element, &mut value).is_err() {
+            // The host did not fit the grammar: write the element without it.
+            value.clear();
+            let element = Element {
+                host: None,
+                ..element
+            };
+            let _ = parse_net::forwarded::write_element(&element, &mut value);
+        }
+        out.push("forwarded", &value);
+    }
+    if matches!(style, ForwardedStyle::Both | ForwardedStyle::XForwarded) {
+        if let Some(c) = facts.client {
+            out.push("x-forwarded-for", alloc::format!("{}", c.ip()).as_bytes());
+        }
+        out.push("x-forwarded-proto", proto.as_bytes());
+        if !facts.host.is_empty() {
+            out.push("x-forwarded-host", facts.host);
+        }
+    }
+}
+
+fn push_frame_facts(facts: &ForwardFacts<'_>, out: &mut FieldList) {
+    let value = match facts.body {
+        BodyFacts::None => alloc::format!("none; fields={}", out.len()),
+        BodyFacts::Length(n) => alloc::format!("length={n}; fields={}", out.len()),
+        BodyFacts::Chunked => alloc::format!("chunked; fields={}", out.len()),
+    };
+    out.push(FRAME_FIELD, value.as_bytes());
+}
+
+/// The fields of the response sent to the client: hop-by-hop fields and
+/// framing removed (the inbound engine frames the body), the route's rules
+/// applied, and `Via` added.
+///
+/// ```
+/// use proxy_net::core::{response_fields, FieldList};
+/// use proxy_net::{HeaderRule, Pool, ProxyBuilder, Route};
+///
+/// let config = ProxyBuilder::new()
+///     .pool("app", Pool::new(["10.0.0.1:80"]))
+///     .route(Route::any().to("app").response_header(HeaderRule::remove("server")))
+///     .config()?;
+/// let route = config.routes().get(0).expect("route");
+/// let upstream = [
+///     ("Content-Type", &b"text/plain"[..]),
+///     ("Content-Length", b"5"),
+///     ("Connection", b"close"),
+///     ("Server", b"app/1.0"),
+/// ];
+/// let mut out = FieldList::new();
+/// response_fields(&upstream, route, &config, &mut out).expect("forward");
+/// let names: Vec<&str> = out.iter().map(|(n, _)| n).collect();
+/// assert_eq!(names, ["content-type", "via"]);
+/// # Ok::<(), proxy_net::ConfigError>(())
+/// ```
+///
+/// # Errors
+///
+/// `UpstreamProtocol` when the upstream's `Connection` value is not a list.
+pub fn response_fields(
+    fields: &[(&str, &[u8])],
+    route: &CompiledRoute,
+    config: &Config,
+    out: &mut FieldList,
+) -> Result<(), ErrorClass> {
+    out.clear();
+    let options = connection_options(fields).map_err(|_| ErrorClass::UpstreamProtocol)?;
+    for (name, value) in fields {
+        if !dropped(name, &options) {
+            out.push(name, value);
+        }
+    }
+    apply_rules(route.response_rules(), out);
+    if let Some(p) = config.via() {
+        let mut v = Vec::with_capacity(4 + p.len());
+        v.extend_from_slice(b"1.1 ");
+        v.extend_from_slice(p.as_bytes());
+        out.push("via", &v);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ByNode, Forwarded, HostHeader, Pool, ProxyBuilder, Route};
+
+    fn config(b: ProxyBuilder) -> Config {
+        b.config().expect("config")
+    }
+
+    fn one(route: Route) -> ProxyBuilder {
+        ProxyBuilder::new()
+            .pool("p", Pool::new(["10.0.0.1:8080"]))
+            .route(route.to("p"))
+    }
+
+    fn run(c: &Config, fields: &[(&str, &[u8])], facts: ForwardFacts<'_>) -> (FieldList, Vec<u8>) {
+        let route = c.routes().get(0).expect("route");
+        let (mut out, mut target) = (FieldList::new(), Vec::new());
+        request_fields(fields, &facts, route, c, &mut out, &mut target).expect("forward");
+        (out, target)
+    }
+
+    #[test]
+    fn test_forwarding_set_is_stripped_and_rebuilt() {
+        // E-80, T-3.
+        let c = config(one(Route::any()));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let fields: Vec<(&str, &[u8])> = crate::FORWARDING_SET
+            .iter()
+            .map(|n| (*n, &b"spoofed"[..]))
+            .chain([("X-FORWARDED-FOR", &b"1.2.3.4"[..]), ("Proxy-Frame", b"x")])
+            .collect();
+        let facts = ForwardFacts::new(b"GET", b"/", b"h", e).client("[2001:db8::1]:9".parse().ok());
+        let (out, _) = run(&c, &fields, facts);
+        assert!(out.iter().all(|(_, v)| v != b"spoofed" && v != b"1.2.3.4"));
+        // E-82: IPv6 quoted and bracketed in Forwarded, bare in X-Forwarded-For.
+        assert_eq!(
+            out.get("forwarded"),
+            Some(&b"for=\"[2001:db8::1]\";proto=http;host=h"[..])
+        );
+        assert_eq!(out.get("x-forwarded-for"), Some(&b"2001:db8::1"[..]));
+        assert_eq!(out.get(FRAME_FIELD), None);
+    }
+
+    #[test]
+    fn test_connection_cannot_remove_proxy_fields() {
+        // E-81, T-6.
+        let c = config(one(Route::any()));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let fields = [
+            (
+                "Connection",
+                &b"x-forwarded-for, via, forwarded, authorization"[..],
+            ),
+            ("Authorization", b"t"),
+        ];
+        let facts = ForwardFacts::new(b"GET", b"/", b"h", e).client("192.0.2.1:1".parse().ok());
+        let (out, _) = run(&c, &fields, facts);
+        assert_eq!(out.get("x-forwarded-for"), Some(&b"192.0.2.1"[..]));
+        assert!(out.get("via").is_some());
+        assert!(out.get("forwarded").is_some());
+        // A field a client names in Connection is hop-by-hop, as RFC 9110 says.
+        assert_eq!(out.get("authorization"), None);
+        assert_eq!(out.get("connection"), None);
+    }
+
+    #[test]
+    fn test_hop_by_hop_framing_and_expect_are_dropped() {
+        let c = config(one(Route::any()));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let fields = [
+            ("Keep-Alive", &b"timeout=5"[..]),
+            ("TE", b"trailers"),
+            ("Transfer-Encoding", b"chunked"),
+            ("Content-Length", b"5"),
+            ("Upgrade", b"h2c"),
+            ("HTTP2-Settings", b"AAMAAABkAAQAAP__"),
+            ("Connection", b"Upgrade, HTTP2-Settings"),
+            ("Proxy-Authorization", b"Basic x"),
+            ("Expect", b"100-continue"),
+            ("Trailer", b"x"),
+            ("X-Keep", b"1"),
+        ];
+        let (out, _) = run(&c, &fields, ForwardFacts::new(b"POST", b"/", b"h", e));
+        let names: Vec<&str> = out.iter().map(|(n, _)| n).collect();
+        // T-10: the h2c upgrade and its settings are gone.
+        assert_eq!(
+            names,
+            [
+                "host",
+                "x-keep",
+                "forwarded",
+                "x-forwarded-proto",
+                "x-forwarded-host",
+                "via"
+            ]
+        );
+        // An unknown client: for=unknown, no X-Forwarded-For (E-84).
+        assert_eq!(
+            out.get("forwarded"),
+            Some(&b"for=unknown;proto=http;host=h"[..])
+        );
+    }
+
+    #[test]
+    fn test_loop_detection() {
+        // E-89, E-90, T-17.
+        let c = config(one(Route::any()).via("edge-1"));
+        let route = c.routes().get(0).expect("route");
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let (mut out, mut target) = (FieldList::new(), Vec::new());
+        let facts = ForwardFacts::new(b"GET", b"/", b"h", e);
+        for via in [
+            &b"1.1 EDGE-1"[..],
+            b"1.0 cdn, 1.1 edge-1 (x)",
+            b"HTTP/1.1 edge-1",
+        ] {
+            assert_eq!(
+                request_fields(&[("Via", via)], &facts, route, &c, &mut out, &mut target),
+                Err(ErrorClass::Loop),
+                "{via:?}"
+            );
+        }
+        assert!(
+            request_fields(
+                &[("Via", &b"1.1 cdn"[..])],
+                &facts,
+                route,
+                &c,
+                &mut out,
+                &mut target
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            out.get_all("via").collect::<Vec<_>>(),
+            [&b"1.1 cdn"[..], b"1.1 edge-1"]
+        );
+        // No Via: no loop detection.
+        let c = config(one(Route::any()).no_via());
+        let route = c.routes().get(0).expect("route");
+        assert!(
+            request_fields(
+                &[("Via", &b"1.1 proxy-net"[..])],
+                &facts,
+                route,
+                &c,
+                &mut out,
+                &mut target
+            )
+            .is_ok()
+        );
+        assert_eq!(out.get_all("via").count(), 1);
+        assert!(!detect_loop([&b"garbage,,(("[..]], "proxy-net"));
+        assert!(detect_loop(
+            [&b"1.1 a, (unclosed, 1.1 proxy-net"[..]],
+            "proxy-net"
+        ));
+    }
+
+    #[test]
+    fn test_host_modes() {
+        let c = config(
+            ProxyBuilder::new()
+                .pool(
+                    "p",
+                    Pool::new(["10.0.0.1:80", "app.internal:8443", "[::1]:80"]),
+                )
+                .route(
+                    Route::any()
+                        .path("/e")
+                        .to("p")
+                        .host_header(HostHeader::Endpoint),
+                )
+                .route(
+                    Route::any()
+                        .path("/f")
+                        .to("p")
+                        .host_header(HostHeader::fixed("fixed.example:81")),
+                )
+                .route(Route::any().to("p")),
+        );
+        let eps = c.pool("p").expect("p").endpoints();
+        let host = |route: usize, ep: usize, tls: bool| {
+            let route = c.routes().get(route).expect("route");
+            let facts =
+                ForwardFacts::new(b"GET", b"/", b"client.example", &eps[ep]).upstream_tls(tls);
+            let (mut out, mut target) = (FieldList::new(), Vec::new());
+            request_fields(&[], &facts, route, &c, &mut out, &mut target).expect("forward");
+            out.get("host").map(<[u8]>::to_vec).unwrap_or_default()
+        };
+        assert_eq!(host(0, 0, false), b"10.0.0.1");
+        assert_eq!(host(0, 1, false), b"app.internal:8443");
+        assert_eq!(host(0, 1, true), b"app.internal:8443");
+        assert_eq!(host(0, 2, false), b"[::1]");
+        assert_eq!(host(0, 0, true), b"10.0.0.1:80");
+        assert_eq!(host(1, 0, false), b"fixed.example:81");
+        assert_eq!(host(2, 0, false), b"client.example");
+    }
+
+    #[test]
+    fn test_rules_and_rewrites() {
+        let c = config(one(Route::any()
+            .path("/v1")
+            .strip_prefix("/v1")
+            .request_header(HeaderRule::set("x-env", "prod"))
+            .request_header(HeaderRule::remove("cookie"))
+            .request_header(HeaderRule::add("x-env", "two"))));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let fields = [("X-Env", &b"client"[..]), ("Cookie", b"a=b")];
+        let (out, target) = run(
+            &c,
+            &fields,
+            ForwardFacts::new(b"GET", b"/v1/x?q=1", b"h", e),
+        );
+        assert_eq!(target, b"/x?q=1");
+        assert_eq!(
+            out.get_all("x-env").collect::<Vec<_>>(),
+            [&b"prod"[..], b"two"]
+        );
+        assert_eq!(out.get("cookie"), None);
+        let mut t = Vec::new();
+        rewrite_target(b"/v1/", &PathRewrite::Strip("/v1/".into()), &mut t);
+        assert_eq!(t, b"/");
+        rewrite_target(
+            b"/a",
+            &PathRewrite::Replace("/a".into(), "/b/".into()),
+            &mut t,
+        );
+        assert_eq!(t, b"/b/");
+        rewrite_target(b"/x", &PathRewrite::None, &mut t);
+        assert_eq!(t, b"/x");
+        rewrite_target(b"/other", &PathRewrite::Strip("/v1".into()), &mut t);
+        assert_eq!(t, b"/other");
+    }
+
+    #[test]
+    fn test_forwarded_styles_and_by() {
+        let e = crate::Endpoint::parse("10.0.0.1:80").expect("e");
+        let facts = ForwardFacts::new(b"GET", b"/", b"example.com:8443", &e)
+            .client("192.0.2.9:4000".parse().ok())
+            .https(true)
+            .listener("198.51.100.1:443".parse().ok());
+        let c = config(one(Route::any()).forwarded(Forwarded::standard().by(ByNode::Listener)));
+        let (out, _) = run(&c, &[], facts);
+        assert_eq!(
+            out.get("forwarded"),
+            Some(
+                &b"for=192.0.2.9;proto=https;by=\"198.51.100.1:443\";host=\"example.com:8443\""[..]
+            )
+        );
+        assert_eq!(out.get("x-forwarded-for"), None);
+        let c = config(one(Route::any()).forwarded(Forwarded::x_forwarded()));
+        let (out, _) = run(&c, &[], facts);
+        assert_eq!(out.get("forwarded"), None);
+        assert_eq!(out.get("x-forwarded-proto"), Some(&b"https"[..]));
+        assert_eq!(out.get("x-forwarded-host"), Some(&b"example.com:8443"[..]));
+        let c = config(one(Route::any()).forwarded(Forwarded::off()));
+        let (out, _) = run(&c, &[("X-Forwarded-For", &b"1.1.1.1"[..])], facts);
+        assert_eq!(
+            out.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            ["host", "via"]
+        );
+        let c = config(
+            one(Route::any()).forwarded(Forwarded::standard().by(ByNode::obfuscated("_edge"))),
+        );
+        let (out, _) = run(&c, &[], facts);
+        assert_eq!(
+            out.get("forwarded"),
+            Some(&b"for=192.0.2.9;proto=https;by=_edge;host=\"example.com:8443\""[..])
+        );
+        // A host that is not a valid host: the element is written without it.
+        let bad = ForwardFacts::new(b"GET", b"/", b"a b", &e);
+        let c = config(one(Route::any()).forwarded(Forwarded::standard()));
+        let (out, _) = run(&c, &[], bad);
+        assert_eq!(out.get("forwarded"), Some(&b"for=unknown;proto=http"[..]));
+    }
+
+    #[test]
+    fn test_frame_facts() {
+        let c = config(one(Route::any()).frame_facts(true));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let (out, _) = run(
+            &c,
+            &[],
+            ForwardFacts::new(b"POST", b"/", b"h", e).body(BodyFacts::Length(12)),
+        );
+        assert_eq!(out.get(FRAME_FIELD), Some(&b"length=12; fields=5"[..]));
+        let (out, _) = run(
+            &c,
+            &[],
+            ForwardFacts::new(b"POST", b"/", b"h", e).body(BodyFacts::Chunked),
+        );
+        assert_eq!(out.get(FRAME_FIELD), Some(&b"chunked; fields=5"[..]));
+        let (out, _) = run(&c, &[], ForwardFacts::new(b"GET", b"/", b"h", e));
+        assert_eq!(out.get(FRAME_FIELD), Some(&b"none; fields=5"[..]));
+    }
+
+    #[test]
+    fn test_invalid_connection_is_refused() {
+        let c = config(one(Route::any()));
+        let route = c.routes().get(0).expect("route");
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let (mut out, mut target) = (FieldList::new(), Vec::new());
+        let facts = ForwardFacts::new(b"GET", b"/", b"h", e);
+        assert_eq!(
+            request_fields(
+                &[("Connection", &b"a\x01b"[..])],
+                &facts,
+                route,
+                &c,
+                &mut out,
+                &mut target
+            ),
+            Err(ErrorClass::Refused(RefusalKind::InvalidField))
+        );
+        assert_eq!(
+            response_fields(&[("Connection", &b"\"open"[..])], route, &c, &mut out),
+            Err(ErrorClass::UpstreamProtocol)
+        );
+    }
+
+    #[test]
+    fn test_response_fields() {
+        let c = config(one(
+            Route::any().response_header(HeaderRule::add("x-proxy", "1"))
+        ));
+        let route = c.routes().get(0).expect("route");
+        let upstream = [
+            ("Transfer-Encoding", &b"chunked"[..]),
+            ("Connection", b"x-internal"),
+            ("X-Internal", b"secret"),
+            ("Keep-Alive", b"timeout=5"),
+            ("Set-Cookie", b"a=1"),
+            ("Set-Cookie", b"b=2"),
+        ];
+        let mut out = FieldList::new();
+        response_fields(&upstream, route, &c, &mut out).expect("forward");
+        let names: Vec<&str> = out.iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["set-cookie", "set-cookie", "x-proxy", "via"]);
+        assert_eq!(trim(b"  a b \t"), b"a b");
+        assert_eq!(trim(b"   "), b"");
+    }
+}

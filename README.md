@@ -34,7 +34,7 @@
 </p>
 
 <p>
-    The decisions (routing, balancing, health, header rewriting, retries) live in a sans-IO core that reads no clock and opens no socket, so the same core runs under serve-net, inside another engine, or in a test. It uses <code>#![forbid(unsafe_code)]</code>, builds without <code>std</code> (it needs only <code>alloc</code>), and has no third-party runtime dependencies.
+    The decisions (routing, balancing, health, header rewriting, retries) live in a sans-IO core that reads no clock and opens no socket, so the same core runs under serve-net, inside another engine, or in a test. It uses <code>#![forbid(unsafe_code)]</code>, builds without <code>std</code> (it needs only <code>alloc</code> and 64-bit atomics), and has no third-party runtime dependencies (its one dependency is the first-party field grammar crate, <code>parse-net</code>).
 </p>
 
 ---
@@ -97,14 +97,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-proxy-net = "0.2"
+proxy-net = "0.3"
 ```
 
 Without the standard library (the configuration types and the core only):
 
 ```toml
 [dependencies]
-proxy-net = { version = "0.2", default-features = false }
+proxy-net = { version = "0.3", default-features = false }
 ```
 
 | Feature | Enables | Default |
@@ -112,7 +112,7 @@ proxy-net = { version = "0.2", default-features = false }
 | `std` | Integration with the standard library. Without it the crate needs only `alloc`. | yes |
 
 **Feature Recommendations**:
-- **Checking a configuration**: the defaults.
+- **Checking a configuration or driving the core**: the defaults.
 - **Embedding the core on `no_std`**: `default-features = false`.
 
 Forwarding over real sockets (`client` and `serve`) arrives in 0.4, and TLS and WebSocket (`tls`, `ws`) in 0.5.
@@ -130,7 +130,7 @@ let running = proxy_net::proxy("0.0.0.0:8080", ["10.0.0.1:80", "10.0.0.2:80"])?;
 running.wait();
 ```
 
-In 0.2, a configuration is built and checked, and its route table answers which pool a request goes to:
+In 0.3, a configuration is built and checked, and its route table answers which pool a request goes to:
 
 ```rust
 use proxy_net::core::RouteMatch;
@@ -184,9 +184,9 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 
 ---
 
-## **Status: Design lock**
+## **Status: Core**
 
-**Current Version:** `0.2.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in, and the configuration surface is built and checked. Nothing forwards traffic yet.
+**Current Version:** `0.3.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in. The configuration surface and the sans-IO core are built: balancing, health, the retry budget, request checks, head rewriting, and the forwarding state machine. Nothing forwards traffic over sockets yet.
 
 **Target:** `1.0.0`, after the roadmap in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
@@ -195,9 +195,11 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 - **Routes** - host, path, and method patterns, the compiled route table, rewrites, header rules, path policies.
 - **Pools** - balancing, health checks, passive health, retries, timeouts, and connection limits as checked settings.
 - **Proxy settings** - limits, forwarding headers, `Via`, and the errors for all of them.
+- **Balancing** - round robin, least connections, power of two choices, Maglev consistent hashing with a load bound, random, first healthy, with tiers and a panic threshold.
+- **Health** - passive ejection with growing back-off and a cap on how much of a pool is ejected, active check results, draining.
+- **Forwarding decisions** - request checks, head rewriting with forwarding headers and `Via`, retries within a budget, and the exchange state machine with every timeout.
 
 **What's planned**:
-- `0.3.0`: the sans-IO core (balancing, health, head rewriting, the forwarding state machine).
 - `0.4.0`: forwarding over real sockets through serve-net, the upstream connection pool, and `proxy_net::proxy`.
 - `0.5.0`: WebSocket, TLS and the PROXY protocol to upstreams, live reload, and service discovery.
 
@@ -266,8 +268,9 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 ### **Version Compatibility**
 - **Rust**: 1.85+ (edition 2024), checked in CI on stable and 1.85
 - **Edition**: 2024
-- **`no_std`**: the configuration types and the core need only `alloc`; CI builds the crate for `thumbv7em-none-eabihf`
+- **`no_std`**: the configuration types and the core need only `alloc` and 64-bit atomics; CI builds the crate for `aarch64-unknown-none`
 - **API Stability**: pre-1.0. The API is locked from 0.2; changes come with a migration note
+- **Dependencies**: `parse-net` (first-party) only
 - **Feature Flags**: `std` (default); `client`, `serve`, `tls`, and `ws` arrive in later versions
 
 ### **Development Setup**

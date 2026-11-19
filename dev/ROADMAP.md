@@ -18,22 +18,24 @@
 - [x] `docs/API.md` with the full API and the version of each item; README, PLAN, ROADMAP rewritten.
 - [x] Tests: unit tests, `tests/config.rs`, `tests/routing.rs` (with a reference matcher).
 - [x] Fuzz targets `endpoint`, `route_pattern`, `route_match`; CI fuzz smoke and `no_std` jobs.
-- [ ] James approves `docs/API.md` (merging this version).
+- [x] James approves `docs/API.md` (merged as #2; GitHub release v0.2.0; not on crates.io, which waits for James).
 
-## v0.3.0 - Core
-- [ ] `core::Tick`; balancers (round robin, least connections, P2C, Maglev with bounded load, random, first) with tiers.
-- [ ] Health table: passive outlier detection, ejection with backoff, panic threshold.
-- [ ] Retry eligibility and budget accounting.
-- [ ] Head rewriting: hop-by-hop removal, forwarding set, rules, `Host`, path rewrites, `Forwarded` and `X-Forwarded-*`, `Via`, loop detection.
-- [ ] Path safety checks; agreement checks (body on `GET`, `TRACE`).
-- [ ] `Exchange` state machine; `ErrorClass`, `ForwardError`.
-- [ ] Defence idea I-1.
-- [ ] Tests: balance, health, forward heads, exchange, core-level attacks, property tests; fuzz `path_check`, `request_fields`, `exchange`.
-- [ ] Exit: `core` builds for a `no_std` target; every 0.3 requirement tested.
+## v0.3.0 - Core (2026-11-19)
+- [x] `core::Tick`; balancers (round robin, least connections, P2C, Maglev with bounded load, random, first) with tiers.
+- [x] Health table: passive outlier detection, ejection with backoff, panic threshold.
+- [x] Retry eligibility and budget accounting.
+- [x] Head rewriting: hop-by-hop removal, forwarding set, rules, `Host`, path rewrites, `Forwarded` and `X-Forwarded-*`, `Via`, loop detection.
+- [x] Path safety checks; agreement checks (body on `GET`, `TRACE`, `CONNECT`).
+- [x] `Exchange` state machine; `ErrorClass`, `ForwardError`.
+- [x] Defence idea I-1 (`frame_facts`).
+- [x] Tests: balance, health, forward heads, core-level attacks, property tests; fuzz `path_check`, `request_fields`, `exchange`.
+- [x] Exit: `core` builds for a `no_std` target (`aarch64-unknown-none`, D-025); every 0.3 requirement tested.
+- Moved to 0.4, with the reason in PLAN D-030: `ProxyBuilder::hash_key`.
 
 ## v0.4.0 - Forwarding
 - [ ] Dependencies: http-net 0.10, parse-net 0.7, net-io 0.8, serve-net 0.8.
 - [ ] `Connector`, `TcpConnector`, the connection pool, the upstream connection, the active health checker, slow start, breaker caps.
+- [ ] `ProxyBuilder::hash_key` (moved from 0.3, D-030).
 - [ ] `ProxyService`, `Proxy`, `Running`, Tier 1 `proxy`; streaming both ways; timeouts and retries; 100-continue, 1xx, trailers; `Observer`; health and stats snapshots.
 - [ ] Defence ideas I-2 and I-3.
 - [ ] Tests: real-socket proxying, socket-level attacks, loom; fuzz `upstream_response`; differential test.
