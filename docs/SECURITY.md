@@ -138,4 +138,3 @@ Results of the 24-hour runs:
 - **Volumetric attacks.** Connection floods and bandwidth exhaustion are for the network and the inbound side (serve-net and net-io admission, per-source caps, rates); proxy-net bounds what each exchange can hold.
 - **A compromised upstream's answers.** A response that is well-formed is relayed. proxy-net parses and bounds it, refuses ambiguous framing, and reports unusually large responses (idea I-4), but it does not judge content.
 - **Certificate pinning by key.** tls-net has no SPKI pins yet; trust only a private CA instead.
-- **WebSocket messages queued while a client is also sending** can wait for serve-net's next ping (its gap G-16), on Windows most of the time and on a loaded Linux machine; this delays messages and loses none.

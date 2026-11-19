@@ -74,7 +74,7 @@ Every threat gets an attack test named after it, in the version that ships its d
 | http-net | 0.10 | upstream request writing and response parsing (`ClientConn`) | 0.4 (added) |
 | parse-net | 0.7 (the version http-net 0.10 pins) | `Forwarded` writing and parsing, list parsing (`Connection`, `Via`) | 0.3 (added) |
 | net-io | 0.8.1 | outbound connections and their deadlines, PROXY encoders (from 0.5) | 0.4 (added) |
-| serve-net | 0.8.2 | the inbound side | 0.4 (added) |
+| serve-net | 0.8.3 | the inbound side | 0.4 (added); 0.8.3 in 0.7 (D-072) |
 | tls-net | 0.10 | TLS to upstreams (feature `tls`) | 0.5 |
 | ws-net | 0.10 | the WebSocket bridge (feature `ws`) | 0.5 |
 
@@ -101,7 +101,7 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | G-13 | tls-net | no SPKI pinning on the client | pin by trusting only a private CA (`UpstreamTls::roots_pem`) |
 | G-14 | serve-net | a `WsSender` cannot close the client's WebSocket | an upstream close is passed on at the client's next message; the tunnel idle timeout ends the rest |
 | G-15 | tls-net | a `TlsStream` cannot be read on one thread and written on another | closed in proxy-net in 0.6: the bridge drives tls-net's `ClientSession` itself (D-058) |
-| G-16 | serve-net | with the blocking driver, messages a `WsSender` queues while the worker is busy with the same connection can wait for the client's next frame or the ping interval: 200 pipelined echoes lost their tail for 30 s on Windows most runs, and over `wss` on a loaded Linux machine in 9 runs of 15; every message was queued without an error | none in proxy-net (a 1 s ping would bound the wait but adds traffic to every idle tunnel and closes clients slower than 2 s to answer); the two pipelined bridge tests are ignored and run by hand; reported for serve-net |
+| G-16 | serve-net | messages a `WsSender` queued while the worker was busy with the same connection could wait for the client's next frame or the ping interval (most runs on Windows; over `wss` on a loaded Linux machine in 9 runs of 15) | closed in serve-net 0.8.3, which proxy-net uses from 0.7; the two pipelined bridge tests run again (D-072) |
 | G-17 | http-net | a `Request` cannot be reused: a target `String` and a field buffer per request | accepted: 7 of the 10 allocations per request, counted in `tests/alloc.rs` |
 | G-18 | serve-net | the client-side WebSocket does not negotiate permessage-deflate | the offer stays narrowed (D-064) |
 
@@ -199,3 +199,4 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | D-069 | 2026-11-20 | The attack suite covers every threat in section 4 with a named test over sockets or on the deciding code; `tests/multi_node.rs` runs a chain, a loop, and failover between proxies | 0.7's exit criterion; T-8, T-9, T-12, T-16, T-18, T-19 (HTTP), T-21, and T-22 had no attack test of their own before |
 | D-070 | 2026-11-20 | Idea I-6 compares the forwarder's upstream bytes with an independent strict reader written in the tests, shared by the CI test and the fuzz target through one file | a second parser from outside the portfolio would be a third-party dependency; a reader written to the RFC alone, stricter than http-net, catches any output that a lenient upstream could read differently |
 | D-071 | 2026-11-20 | The 24-hour fuzz campaign runs all nine targets in parallel at low priority, the soak at about 6,000 requests per second on Linux and Windows; the soak's harness avoids exhausting loopback ports (aborts 0.1%, refused requests 0.5%) and counts connect failures apart | the machine is shared; on one Windows host every closed loopback connection waits 4 minutes in TIME_WAIT, so a soak that churns connections measures the port table, not the proxy |
+| D-072 | 2026-11-19 | serve-net 0.8.3, which fixes G-16; the two pipelined bridge tests run again on every platform (supersedes D-066); the 24-hour soaks restart on it | measured after the move: 20 of 20 runs of each test file passed on Windows with the soak running, and 20 of 20 on WSL at a load average of 17, none slower than 5 s (before: most Windows runs, and 9 of 15 `wss` runs on WSL, stalled 30 s). serve-net's fix is in its wake handling, which the soak's HTTP traffic hardly uses, but the soak should cover the version that ships |

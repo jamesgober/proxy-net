@@ -48,14 +48,14 @@ and the memory an exchange holds.
 
 ### Changed
 
+- serve-net 0.8.3, which fixes WebSocket messages that could wait for the
+  next ping when the client was sending at the same time. The two pipelined
+  bridge tests, ignored in 0.6, run again.
 - The load generator in `benches/compare.rs` reads any status, so refusals
   are counted without closing the connection.
 
 ### Known gaps
 
-- serve-net 0.8 can hold messages queued for a WebSocket client until its
-  next ping when the client is sending at the same time. The two pipelined
-  bridge tests stay ignored until serve-net's fix ships.
 - The reactor path waits for serve-net and net-io (see the roadmap).
 
 ---

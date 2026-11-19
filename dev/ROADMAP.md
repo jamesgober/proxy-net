@@ -61,14 +61,14 @@
 
 ## v0.7.0 - Hardening (2026-11-20)
 - [ ] 24-hour fuzz campaign per target (nine targets, `differential` included).
-- [ ] 24-hour soak on Linux and on Windows (`benches/soak.rs`, D-071).
+- [ ] 24-hour soak on Linux and on Windows on serve-net 0.8.3 (`benches/soak.rs`, D-071, D-072).
 - [x] The full attack suite: every threat T-1 to T-22 has a named test (`tests/attacks_suite.rs` adds T-8, T-9, T-12, T-16, T-18, T-19, T-21, T-22; D-069).
 - [x] The multi-node test (`tests/multi_node.rs`: a chain, a loop, failover).
 - [x] Idea I-6 (`tests/differential.rs`, the `differential` fuzz target; D-070).
 - [x] `docs/SECURITY.md`.
 - [x] Memory per active exchange: 27.3 KiB by default, 15.3 KiB with `Inbound::read_buffer(4096)`, under the 20 KiB target (`tests/memory.rs`, D-067).
 - [x] Idea I-5 on sockets: it agrees with the simulation when clients back off on 503; shipped as an experimental opt-in, `PoolLimits::adaptive_concurrency` (D-068).
-- Open, waiting on serve-net: its fix for G-16 (a 0.8.x patch); then move to it and re-enable the two ignored pipelined bridge tests (D-066), in the first proxy-net version after it ships.
+- [x] serve-net 0.8.3 fixes G-16: proxy-net moved to it and the two pipelined bridge tests run again (D-072).
 
 ## v0.8.0 - Alpha
 - [ ] A gateway deployment uses proxy-net for its proxy and load-balancer roles end to end; `docs/OPERATIONS.md`, `docs/PLATFORM-NOTES.md`.
