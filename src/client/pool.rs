@@ -40,9 +40,13 @@ pub(crate) struct EndpointConns {
 }
 
 /// What `take` found.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "moved once per exchange; boxing it allocated on every reuse"
+)]
 pub(crate) enum Taken {
     /// A pooled connection that passed every reuse check.
-    Pooled(Box<UpstreamConn>),
+    Pooled(UpstreamConn),
     /// A place for a new connection: dial it, then `opened` or `dial_failed`.
     Dial,
 }
@@ -86,7 +90,7 @@ impl EndpointConns {
                     && fresh;
                 if usable && idle.conn.io.is_reusable() {
                     idle.conn.reused = true;
-                    return Ok(Taken::Pooled(Box::new(idle.conn)));
+                    return Ok(Taken::Pooled(idle.conn));
                 }
                 idle.conn.io.close();
                 slots.open = slots.open.saturating_sub(1);

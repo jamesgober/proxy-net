@@ -46,6 +46,31 @@ impl FieldList {
         self.spans.push((start as u32, mid as u32, end as u32));
     }
 
+    /// Adds a field at the end whose value `write` appends to the buffer it
+    /// is given, so a value built from parts needs no buffer of its own.
+    /// `write` only appends; a `write` that removes bytes before its own
+    /// adds no field.
+    ///
+    /// ```
+    /// let mut f = proxy_net::core::FieldList::new();
+    /// f.push_with("Via", |v| v.extend_from_slice(b"1.1 edge"));
+    /// assert_eq!(f.get("via"), Some(&b"1.1 edge"[..]));
+    /// ```
+    pub fn push_with(&mut self, name: &str, write: impl FnOnce(&mut Vec<u8>)) {
+        let start = self.bytes.len();
+        self.bytes
+            .extend(name.bytes().map(|b| b.to_ascii_lowercase()));
+        let mid = self.bytes.len();
+        write(&mut self.bytes);
+        if self.bytes.len() < mid {
+            // `write` cut into the name: the field is not added.
+            self.bytes.truncate(start);
+            return;
+        }
+        let end = self.bytes.len();
+        self.spans.push((start as u32, mid as u32, end as u32));
+    }
+
     /// Removes every field named `name` (any case).
     pub fn remove(&mut self, name: &str) {
         let bytes = &self.bytes;
@@ -82,6 +107,12 @@ impl FieldList {
             .map(|(_, v)| v)
     }
 
+    /// Bytes of capacity held by the list's buffers.
+    #[cfg(feature = "client")]
+    pub(crate) fn capacity(&self) -> usize {
+        self.bytes.capacity() + self.spans.capacity() * core::mem::size_of::<(u32, u32, u32)>()
+    }
+
     /// The number of fields.
     pub fn len(&self) -> usize {
         self.spans.len()
@@ -90,6 +121,31 @@ impl FieldList {
     /// True when there are no fields.
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
+    }
+}
+
+/// Header fields the rewriting functions can read in place: a slice of
+/// pairs or a [`FieldList`].
+pub(crate) trait FieldSource {
+    /// The fields in order, names as received.
+    fn fields(&self) -> impl Iterator<Item = (&str, &[u8])> + '_;
+}
+
+impl FieldSource for [(&str, &[u8])] {
+    fn fields(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+        self.iter().map(|&(n, v)| (n, v))
+    }
+}
+
+impl FieldSource for Vec<(&str, &[u8])> {
+    fn fields(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+        self.iter().map(|&(n, v)| (n, v))
+    }
+}
+
+impl FieldSource for FieldList {
+    fn fields(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+        self.iter()
     }
 }
 
@@ -115,5 +171,8 @@ mod tests {
         assert!(f.is_empty());
         f.push("x", b"");
         assert_eq!(f.get("x"), Some(&b""[..]));
+        f.push_with("Y", |v| v.extend_from_slice(b"12"));
+        assert_eq!(f.get("y"), Some(&b"12"[..]));
+        assert_eq!(f.fields().count(), 2);
     }
 }

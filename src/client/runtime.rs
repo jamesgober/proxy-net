@@ -336,6 +336,15 @@ impl Shared {
     }
 
     /// A copy of the current builder.
+    /// True when any pool has a discovery source, checked without copying
+    /// the configuration.
+    pub(crate) fn discovers(&self) -> bool {
+        self.builder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .discovers()
+    }
+
     pub(crate) fn builder(&self) -> ProxyBuilder {
         self.builder
             .lock()

@@ -166,6 +166,12 @@ struct Current {
     buf: Vec<u8>,
 }
 
+impl Drop for Current {
+    fn drop(&mut self) {
+        crate::client::spare::give_bytes(core::mem::take(&mut self.buf));
+    }
+}
+
 thread_local! {
     static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
 }
@@ -208,11 +214,15 @@ impl ProxyService {
             }
             _ => None,
         });
+        let mut fields = crate::client::spare::list();
+        for (n, v) in head.headers() {
+            fields.push(n, v);
+        }
         RequestParts {
             method: head.method_str().into(),
             target: target.into_boxed_str(),
             host: host_of(head).into(),
-            fields: head.headers().map(|(n, v)| (n.into(), v.into())).collect(),
+            fields,
             client,
             https: head.client().scheme() == Scheme::Https,
             body,
@@ -420,7 +430,7 @@ impl HttpService for ProxyService {
                     seq: env.seq(),
                     forward,
                     relaying: false,
-                    buf: Vec::new(),
+                    buf: crate::client::spare::bytes(),
                 });
             });
         }
@@ -458,6 +468,7 @@ impl HttpService for ProxyService {
                 for (name, value) in start.fields.iter() {
                     let _ = reply.header(name, value);
                 }
+                crate::client::spare::give_list(start.fields);
                 if !start.has_body {
                     let mut ignored = Vec::new();
                     let _ = current.forward.read_body(&mut ignored, 0);

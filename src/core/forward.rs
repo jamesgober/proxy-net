@@ -13,7 +13,7 @@ use core::net::{IpAddr, SocketAddr};
 use parse_net::forwarded::{Element, Node, NodePort, Proto};
 
 use super::class::{ErrorClass, RefusalKind};
-use super::fields::FieldList;
+use super::fields::{FieldList, FieldSource};
 use super::route::{CompiledRoute, PathRewrite};
 use crate::config::{ByNode, Config, ForwardedStyle};
 use crate::endpoint::{Endpoint, EndpointAddr};
@@ -195,6 +195,17 @@ where
     })
 }
 
+/// `core::fmt::Write` over a byte buffer: addresses and numbers are written
+/// in place instead of through a `String`.
+struct Bytes<'a>(&'a mut Vec<u8>);
+
+impl core::fmt::Write for Bytes<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
 /// The elements of a comma-separated list value, through parse-net; a value
 /// that is not a valid list is split at every comma (only used for matching,
 /// never written).
@@ -222,9 +233,9 @@ fn trim(s: &[u8]) -> &[u8] {
 }
 
 /// The tokens every `Connection` field names, lowercase-compared later.
-fn connection_options<'a>(fields: &[(&'a str, &'a [u8])]) -> Result<Vec<&'a [u8]>, ErrorClass> {
+fn connection_options<F: FieldSource + ?Sized>(fields: &F) -> Result<Vec<&[u8]>, ErrorClass> {
     let mut out = Vec::new();
-    for (name, value) in fields {
+    for (name, value) in fields.fields() {
         if name.eq_ignore_ascii_case("connection") {
             let list = parse_net::list(value)
                 .map_err(|_| ErrorClass::Refused(RefusalKind::InvalidField))?;
@@ -329,19 +340,32 @@ pub fn request_fields(
     out: &mut FieldList,
     target: &mut Vec<u8>,
 ) -> Result<(), ErrorClass> {
+    request_fields_in(fields, facts, route, config, out, target)
+}
+
+/// [`request_fields`] over any field store, so a caller's list is read in
+/// place.
+pub(crate) fn request_fields_in<F: FieldSource + ?Sized>(
+    fields: &F,
+    facts: &ForwardFacts<'_>,
+    route: &CompiledRoute,
+    config: &Config,
+    out: &mut FieldList,
+    target: &mut Vec<u8>,
+) -> Result<(), ErrorClass> {
     out.clear();
     if let Some(p) = config.via() {
         let via = fields
-            .iter()
+            .fields()
             .filter(|(n, _)| n.eq_ignore_ascii_case("via"))
-            .map(|(_, v)| *v);
+            .map(|(_, v)| v);
         if detect_loop(via, p) {
             return Err(ErrorClass::Loop);
         }
     }
     let options = connection_options(fields)?;
     push_host(facts, route, out);
-    for (name, value) in fields {
+    for (name, value) in fields.fields() {
         let stripped = config
             .stripped_headers()
             .any(|s| s.eq_ignore_ascii_case(name));
@@ -368,10 +392,7 @@ pub fn request_fields(
     }
     push_forwarding(fields, facts, config, out);
     if let Some(p) = config.via() {
-        let mut v = Vec::with_capacity(4 + p.len());
-        v.extend_from_slice(b"1.1 ");
-        v.extend_from_slice(p.as_bytes());
-        out.push("via", &v);
+        push_via(p, out);
     }
     if config.frame_facts() {
         push_frame_facts(facts, out);
@@ -381,40 +402,56 @@ pub fn request_fields(
 }
 
 fn push_host(facts: &ForwardFacts<'_>, route: &CompiledRoute, out: &mut FieldList) {
+    use core::fmt::Write;
     match route.host_header() {
         HostHeader::Fixed(h) => out.push("host", h.as_bytes()),
         HostHeader::Endpoint => {
             let default = if facts.upstream_tls { 443 } else { 80 };
             let e = facts.endpoint;
             let port = e.addr().port();
-            let mut v: Vec<u8> = Vec::new();
-            match (e.server_name_value(), e.addr()) {
-                (Some(name), _) => v.extend_from_slice(name.as_bytes()),
-                (None, EndpointAddr::Ip(a)) => match a.ip() {
-                    IpAddr::V4(ip) => v.extend_from_slice(alloc::format!("{ip}").as_bytes()),
-                    IpAddr::V6(ip) => v.extend_from_slice(alloc::format!("[{ip}]").as_bytes()),
-                },
-                (None, EndpointAddr::Name { host, .. }) => v.extend_from_slice(host.as_bytes()),
-            }
-            if port != default {
-                v.extend_from_slice(alloc::format!(":{port}").as_bytes());
-            }
-            out.push("host", &v);
+            out.push_with("host", |v| {
+                match (e.server_name_value(), e.addr()) {
+                    (Some(name), _) => v.extend_from_slice(name.as_bytes()),
+                    (None, EndpointAddr::Ip(a)) => match a.ip() {
+                        IpAddr::V4(ip) => {
+                            let _ = write!(Bytes(v), "{ip}");
+                        }
+                        IpAddr::V6(ip) => {
+                            let _ = write!(Bytes(v), "[{ip}]");
+                        }
+                    },
+                    (None, EndpointAddr::Name { host, .. }) => v.extend_from_slice(host.as_bytes()),
+                }
+                if port != default {
+                    let _ = write!(Bytes(v), ":{port}");
+                }
+            });
         }
         _ => out.push("host", facts.host),
     }
+}
+
+/// `Via: 1.1 <pseudonym>`.
+fn push_via(pseudonym: &str, out: &mut FieldList) {
+    out.push_with("via", |v| {
+        v.extend_from_slice(b"1.1 ");
+        v.extend_from_slice(pseudonym.as_bytes());
+    });
 }
 
 /// The elements of the incoming chain added by trusted proxies: the last
 /// `hops` of `Forwarded` (re-serialized) and of `X-Forwarded-For`. `None`
 /// when either does not parse (the chain is then replaced, as when it is not
 /// trusted).
-fn trusted_chain(fields: &[(&str, &[u8])], hops: u8) -> Option<(Vec<Vec<u8>>, Vec<IpAddr>)> {
+fn trusted_chain<F: FieldSource + ?Sized>(
+    fields: &F,
+    hops: u8,
+) -> Option<(Vec<Vec<u8>>, Vec<IpAddr>)> {
     let lines = |name: &str| -> Vec<&[u8]> {
         fields
-            .iter()
+            .fields()
             .filter(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| *v)
+            .map(|(_, v)| v)
             .collect()
     };
     let limits = parse_net::Limits::DEFAULT;
@@ -439,8 +476,8 @@ fn trusted_chain(fields: &[(&str, &[u8])], hops: u8) -> Option<(Vec<Vec<u8>>, Ve
     Some((elements, addrs))
 }
 
-fn push_forwarding(
-    fields: &[(&str, &[u8])],
+fn push_forwarding<F: FieldSource + ?Sized>(
+    fields: &F,
     facts: &ForwardFacts<'_>,
     config: &Config,
     out: &mut FieldList,
@@ -481,63 +518,71 @@ fn push_forwarding(
                 Proto::Http
             }),
         };
-        let mut value = Vec::new();
-        if let Some((elements, _)) = &chain {
-            let elements: &Vec<Vec<u8>> = elements;
-            let mut first = true;
-            // A chain the inbound engine trusted but no Forwarded line came
-            // with (PROXY protocol, X-Forwarded-For only): start from the client.
-            if elements.is_empty() {
-                if let Some(c) = facts.client {
-                    let e = Element {
-                        for_: Some(Node::Addr(c.ip(), None)),
-                        by: None,
-                        host: None,
-                        proto: None,
-                    };
-                    let _ = parse_net::forwarded::write_element(&e, &mut value);
+        out.push_with("forwarded", |value| {
+            if let Some((elements, _)) = &chain {
+                let elements: &Vec<Vec<u8>> = elements;
+                let mut first = true;
+                // A chain the inbound engine trusted but no Forwarded line
+                // came with (PROXY protocol, X-Forwarded-For only): start
+                // from the client.
+                if elements.is_empty() {
+                    if let Some(c) = facts.client {
+                        let e = Element {
+                            for_: Some(Node::Addr(c.ip(), None)),
+                            by: None,
+                            host: None,
+                            proto: None,
+                        };
+                        let _ = parse_net::forwarded::write_element(&e, value);
+                        first = false;
+                    }
+                }
+                for e in elements {
+                    if !first {
+                        value.extend_from_slice(b", ");
+                    }
+                    value.extend_from_slice(e);
                     first = false;
                 }
-            }
-            for e in elements {
                 if !first {
                     value.extend_from_slice(b", ");
                 }
-                value.extend_from_slice(e);
-                first = false;
             }
-            if !first {
-                value.extend_from_slice(b", ");
+            let start = value.len();
+            if parse_net::forwarded::write_element(&element, value).is_err() {
+                value.truncate(start);
+                // The host did not fit the grammar: write the element
+                // without it.
+                let element = Element {
+                    host: None,
+                    ..element
+                };
+                let _ = parse_net::forwarded::write_element(&element, value);
             }
-        }
-        let start = value.len();
-        if parse_net::forwarded::write_element(&element, &mut value).is_err() {
-            value.truncate(start);
-            // The host did not fit the grammar: write the element without it.
-            let element = Element {
-                host: None,
-                ..element
-            };
-            let _ = parse_net::forwarded::write_element(&element, &mut value);
-        }
-        out.push("forwarded", &value);
+        });
     }
     if matches!(style, ForwardedStyle::Both | ForwardedStyle::XForwarded) {
+        use core::fmt::Write;
         match (&chain, facts.peer) {
             (Some((_, addrs)), Some(peer)) => {
-                let mut list: Vec<alloc::string::String> =
-                    addrs.iter().map(|a| alloc::format!("{a}")).collect();
-                if list.is_empty() {
-                    if let Some(c) = facts.client {
-                        list.push(alloc::format!("{}", c.ip()));
+                out.push_with("x-forwarded-for", |v| {
+                    let mut w = Bytes(v);
+                    for a in addrs {
+                        let _ = write!(w, "{a}, ");
                     }
-                }
-                list.push(alloc::format!("{}", peer.ip()));
-                out.push("x-forwarded-for", list.join(", ").as_bytes());
+                    if addrs.is_empty() {
+                        if let Some(c) = facts.client {
+                            let _ = write!(w, "{}, ", c.ip());
+                        }
+                    }
+                    let _ = write!(w, "{}", peer.ip());
+                });
             }
             _ => {
                 if let Some(c) = facts.client {
-                    out.push("x-forwarded-for", alloc::format!("{}", c.ip()).as_bytes());
+                    out.push_with("x-forwarded-for", |v| {
+                        let _ = write!(Bytes(v), "{}", c.ip());
+                    });
                 }
             }
         }
@@ -549,12 +594,16 @@ fn push_forwarding(
 }
 
 fn push_frame_facts(facts: &ForwardFacts<'_>, out: &mut FieldList) {
-    let value = match facts.body {
-        BodyFacts::None => alloc::format!("none; fields={}", out.len()),
-        BodyFacts::Length(n) => alloc::format!("length={n}; fields={}", out.len()),
-        BodyFacts::Chunked => alloc::format!("chunked; fields={}", out.len()),
-    };
-    out.push(FRAME_FIELD, value.as_bytes());
+    use core::fmt::Write;
+    let fields = out.len();
+    out.push_with(FRAME_FIELD, |v| {
+        let mut w = Bytes(v);
+        let _ = match facts.body {
+            BodyFacts::None => write!(w, "none; fields={fields}"),
+            BodyFacts::Length(n) => write!(w, "length={n}; fields={fields}"),
+            BodyFacts::Chunked => write!(w, "chunked; fields={fields}"),
+        };
+    });
 }
 
 /// The fields of the response sent to the client: hop-by-hop fields and
@@ -592,19 +641,26 @@ pub fn response_fields(
     config: &Config,
     out: &mut FieldList,
 ) -> Result<(), ErrorClass> {
+    response_fields_in(fields, route, config, out)
+}
+
+/// [`response_fields`] over any field store.
+pub(crate) fn response_fields_in<F: FieldSource + ?Sized>(
+    fields: &F,
+    route: &CompiledRoute,
+    config: &Config,
+    out: &mut FieldList,
+) -> Result<(), ErrorClass> {
     out.clear();
     let options = connection_options(fields).map_err(|_| ErrorClass::UpstreamProtocol)?;
-    for (name, value) in fields {
+    for (name, value) in fields.fields() {
         if !dropped(name, &options) {
             out.push(name, value);
         }
     }
     apply_rules(route.response_rules(), out);
     if let Some(p) = config.via() {
-        let mut v = Vec::with_capacity(4 + p.len());
-        v.extend_from_slice(b"1.1 ");
-        v.extend_from_slice(p.as_bytes());
-        out.push("via", &v);
+        push_via(p, out);
     }
     Ok(())
 }
