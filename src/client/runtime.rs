@@ -25,6 +25,10 @@ pub(crate) struct PoolRuntime {
     pub budget: RetryBudget,
     pub conns: Box<[Arc<EndpointConns>]>,
     pub connector: Arc<dyn Connector>,
+    /// The pool's TLS settings as a connector, for the WebSocket bridge,
+    /// which drives its own sockets.
+    #[cfg(all(feature = "tls", feature = "ws"))]
+    pub tls: Option<Arc<super::tls::TlsConnector>>,
 }
 
 /// Response size statistics of one route (idea I-4).
@@ -48,23 +52,41 @@ pub(crate) struct Runtime {
     pub generation: u32,
 }
 
+/// A pool's TLS connector, when it has TLS settings.
+#[cfg(feature = "tls")]
+type TlsPart = Option<Arc<super::tls::TlsConnector>>;
+
 /// The connector for one pool: the configured one, or TCP (with TLS when the
-/// pool has it and the `tls` feature is on).
+/// pool has it and the `tls` feature is on). With TLS, also the TLS
+/// connector itself, built once for both uses.
+#[cfg(feature = "tls")]
 fn connector_for(
     pool: &crate::pool::PoolConfig,
     custom: Option<&Arc<dyn Connector>>,
-) -> Result<Arc<dyn Connector>, crate::ConfigError> {
+) -> Result<(Arc<dyn Connector>, TlsPart), crate::ConfigError> {
+    let tls = match pool.tls() {
+        Some(t) => Some(Arc::new(super::tls::TlsConnector::new(t).map_err(
+            |reason| crate::ConfigError::new(crate::ConfigItem::Pool(pool.name().into()), reason),
+        )?)),
+        None => None,
+    };
+    let connector: Arc<dyn Connector> = match (custom, &tls) {
+        (Some(c), _) => Arc::clone(c),
+        (None, Some(t)) => Arc::clone(t) as Arc<dyn Connector>,
+        (None, None) => Arc::new(super::connector::TcpConnector::new()),
+    };
+    Ok((connector, tls))
+}
+
+/// The connector for one pool: the configured one, or TCP.
+#[cfg(not(feature = "tls"))]
+fn connector_for(
+    pool: &crate::pool::PoolConfig,
+    custom: Option<&Arc<dyn Connector>>,
+) -> Result<(Arc<dyn Connector>, ()), crate::ConfigError> {
     if let Some(c) = custom {
-        return Ok(Arc::clone(c));
+        return Ok((Arc::clone(c), ()));
     }
-    #[cfg(feature = "tls")]
-    if let Some(tls) = pool.tls() {
-        let c = super::tls::TlsConnector::new(tls).map_err(|reason| {
-            crate::ConfigError::new(crate::ConfigItem::Pool(pool.name().into()), reason)
-        })?;
-        return Ok(Arc::new(c));
-    }
-    #[cfg(not(feature = "tls"))]
     if pool.tls().is_some() {
         return Err(crate::ConfigError::new(
             crate::ConfigItem::Pool(pool.name().into()),
@@ -73,7 +95,7 @@ fn connector_for(
             },
         ));
     }
-    Ok(Arc::new(super::connector::TcpConnector::new()))
+    Ok((Arc::new(super::connector::TcpConnector::new()), ()))
 }
 
 impl Runtime {
@@ -133,12 +155,18 @@ impl Runtime {
                     }));
             }
             let _ = balancer.refresh(&health);
+            #[cfg(all(feature = "tls", feature = "ws"))]
+            let (connector, tls) = connector_for(p, custom)?;
+            #[cfg(not(all(feature = "tls", feature = "ws")))]
+            let (connector, _) = connector_for(p, custom)?;
             pools.push(PoolRuntime {
                 balancer,
                 health,
                 budget: RetryBudget::new(p.retry()),
                 conns: conns.into_boxed_slice(),
-                connector: connector_for(p, custom)?,
+                connector,
+                #[cfg(all(feature = "tls", feature = "ws"))]
+                tls,
             });
         }
         let routes = (0..config.routes().len())

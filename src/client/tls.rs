@@ -6,7 +6,7 @@ use std::string::{String, ToString};
 use std::time::Instant;
 
 use net_io::{Phase, TcpConnection};
-use tls_net::{Alpn, KeySource, TlsClient, TlsStream, TrustAnchors};
+use tls_net::{Alpn, ClientSession, KeySource, TlsClient, TlsStream, TrustAnchors};
 
 use super::connector::{Connector, TcpConnector, UpstreamIo};
 use crate::core::{ErrorClass, TimeoutKind};
@@ -66,6 +66,19 @@ impl TlsConnector {
     }
 }
 
+impl TlsConnector {
+    /// A new client session for `endpoint`: the pool's server name, or the
+    /// endpoint's host or address.
+    pub(crate) fn session(&self, endpoint: &EndpointAddr) -> Result<ClientSession, ErrorClass> {
+        let name = match (&self.server_name, endpoint) {
+            (Some(n), _) => n.clone(),
+            (None, EndpointAddr::Name { host, .. }) => host.to_string(),
+            (None, EndpointAddr::Ip(a)) => a.ip().to_string(),
+        };
+        self.client.connect(&name).map_err(|_| ErrorClass::Tls)
+    }
+}
+
 impl Connector for TlsConnector {
     fn connect(
         &self,
@@ -74,12 +87,7 @@ impl Connector for TlsConnector {
         deadline: Instant,
     ) -> Result<Box<dyn UpstreamIo>, ErrorClass> {
         let mut tcp = self.tcp.dial(endpoint, prelude, deadline)?;
-        let name = match (&self.server_name, endpoint) {
-            (Some(n), _) => n.clone(),
-            (None, EndpointAddr::Name { host, .. }) => host.to_string(),
-            (None, EndpointAddr::Ip(a)) => a.ip().to_string(),
-        };
-        let session = self.client.connect(&name).map_err(|_| ErrorClass::Tls)?;
+        let session = self.session(endpoint)?;
         tcp.set_phase(Phase::Receiving);
         tcp.set_exchange_deadline(Some(deadline));
         let stream = TlsStream::client(session, tcp).map_err(|_| ErrorClass::Tls)?;

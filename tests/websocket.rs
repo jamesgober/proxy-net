@@ -173,3 +173,31 @@ fn test_upgrades_get_the_path_checks() {
     }
     assert!(upgrade_status_at(addr, "/fine").starts_with("HTTP/1.1 101"));
 }
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "serve-net 0.8 on Windows can hold queued client messages until its next ping (G-16)"
+)]
+fn test_pipelined_messages_all_come_back() {
+    // Every message goes out before any echo is read, so echoes are queued
+    // for the client while its own messages still arrive.
+    let (_p, addr) = proxy_to(echo_upstream());
+    let stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("timeout");
+    let hs = ClientHandshake::try_new().expect("handshake");
+    let (mut ws, _) =
+        blocking::connect_with(stream, &addr.to_string(), "/socket", &hs).expect("upgrade");
+    for i in 0..200 {
+        ws.send_text(&format!("message {i}")).expect("send");
+    }
+    for i in 0..200 {
+        match ws.read().expect("read") {
+            Message::Text(t) => assert_eq!(t, format!("message {i}")),
+            other => panic!("at {i}: expected text, got {other:?}"),
+        }
+    }
+    ws.close(CloseCode::NORMAL, "done").expect("close");
+}

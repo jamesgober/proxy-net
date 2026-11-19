@@ -8,8 +8,10 @@ pub(crate) mod discovery;
 pub(crate) mod forward;
 pub(crate) mod pool;
 pub(crate) mod runtime;
+#[cfg(all(feature = "tls", feature = "ws"))]
+pub(crate) mod split;
 #[cfg(feature = "tls")]
-mod tls;
+pub(crate) mod tls;
 
 pub use connector::{Connector, TcpConnector, TcpUpstream, UpstreamIo};
 pub use discovery::{Discovery, DiscoveryError, DnsDiscovery, StaticDiscovery};
