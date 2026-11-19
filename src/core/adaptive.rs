@@ -1,4 +1,4 @@
-//! Idea I-5: a gradient concurrency limit (experiment, not used by pools).
+//! Idea I-5: a gradient concurrency limit, behind `PoolLimits::adaptive_concurrency`.
 //!
 //! Hypothesis: a limit that follows an endpoint's latency finds the point
 //! where the endpoint starts queueing (the knee) better than a fixed cap,
@@ -23,7 +23,7 @@
 //! The simulation in the tests sweeps offered load against an endpoint with
 //! a knee; the results and the decision are in PLAN (I-5, D-063).
 
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(not(any(test, feature = "client")), allow(dead_code))]
 
 use super::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, update_u32};
 
