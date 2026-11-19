@@ -1,0 +1,40 @@
+[package]
+name    = "proxy-net-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0 OR MIT"
+authors = ["James Gober <me@jamesgober.com>"]
+description = "cargo-fuzz targets for proxy-net (not published)."
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone: not a member of any workspace above it.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary     = { version = "1", features = ["derive"] }
+proxy-net     = { path = ".." }
+
+[[bin]]
+name  = "endpoint"
+path  = "fuzz_targets/endpoint.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "route_pattern"
+path  = "fuzz_targets/route_pattern.rs"
+test  = false
+doc   = false
+bench = false
+
+[[bin]]
+name  = "route_match"
+path  = "fuzz_targets/route_match.rs"
+test  = false
+doc   = false
+bench = false
