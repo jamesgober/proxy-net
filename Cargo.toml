@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "proxy-net"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -46,10 +46,15 @@ path = "src/lib.rs"
 # FEATURE FLAGS
 # #################################
 [features]
-default = ["std"]
+default = ["serve"]
 # Integration with the standard library. Without it the crate needs only
 # `alloc` (the configuration types and the sans-IO core).
 std = []
+# The upstream side over net-io: connections, the connection pool, the
+# health checker, and the blocking forwarder.
+client = ["std", "dep:net-io", "dep:http-net"]
+# The inbound side: the serve-net service and `proxy_net::proxy`.
+serve = ["client", "dep:serve-net"]
 
 
 # DEPENDENCIES
@@ -58,6 +63,21 @@ std = []
 # Field grammar: list parsing (Connection, Via) and Forwarded writing. 0.7
 # is the version http-net 0.10 pins, so the two agree when http-net joins.
 parse-net = { version = "0.7", default-features = false, features = ["alloc"] }
+# The upstream HTTP/1.1 client (`ClientConn`), sans-IO.
+http-net = { version = "0.10", default-features = false, optional = true }
+# Outbound TCP connections, deadlines, and the PROXY encoders.
+net-io = { version = "0.8.1", default-features = false, features = ["proxy"], optional = true }
+# The inbound engine.
+serve-net = { version = "0.8.2", default-features = false, features = ["http1"], optional = true }
+
+
+# Model-checking the lock-free core (tests/loom.rs); only with
+# RUSTFLAGS="--cfg proxy_net_loom", never in a normal build.
+[target.'cfg(proxy_net_loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(proxy_net_loom)"] }
 
 
 # DEV DEPENDENCIES

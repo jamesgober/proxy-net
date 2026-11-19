@@ -34,7 +34,7 @@
 </p>
 
 <p>
-    The decisions (routing, balancing, health, header rewriting, retries) live in a sans-IO core that reads no clock and opens no socket, so the same core runs under serve-net, inside another engine, or in a test. It uses <code>#![forbid(unsafe_code)]</code>, builds without <code>std</code> (it needs only <code>alloc</code> and 64-bit atomics), and has no third-party runtime dependencies (its one dependency is the first-party field grammar crate, <code>parse-net</code>).
+    The decisions (routing, balancing, health, header rewriting, retries) live in a sans-IO core that reads no clock and opens no socket, so the same core runs under serve-net, inside another engine, or in a test. It uses <code>#![forbid(unsafe_code)]</code>, builds without <code>std</code> (it needs only <code>alloc</code> and 64-bit atomics), and has no third-party runtime dependencies: everything it uses is first-party (<code>parse-net</code>, <code>http-net</code>, <code>net-io</code>, <code>serve-net</code>).
 </p>
 
 ---
@@ -52,7 +52,7 @@
 - **Policies** - smooth weighted round robin, least connections, power of two choices, Maglev consistent hashing with a load bound, random, and first healthy.
 - **Health** - active checks (HTTP or TCP, with jitter, rise and fall counts) and passive outlier detection with a panic threshold.
 
-### **Forwarding** (from 0.4)
+### **Forwarding**
 - **Re-serialized** - requests and responses parsed strictly and written again.
 - **Streamed** - bodies relayed with bounded buffers and backpressure both ways.
 - **Retries** - only for idempotent requests whose body is held in full, before any response byte reached the client, under a retry budget.
@@ -97,25 +97,28 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-proxy-net = "0.3"
+proxy-net = "0.4"
 ```
 
 Without the standard library (the configuration types and the core only):
 
 ```toml
 [dependencies]
-proxy-net = { version = "0.3", default-features = false }
+proxy-net = { version = "0.4", default-features = false }
 ```
 
 | Feature | Enables | Default |
 |---|---|---|
-| `std` | Integration with the standard library. Without it the crate needs only `alloc`. | yes |
+| `serve` | The serve-net service, `Proxy::serve`, and `proxy_net::proxy`. Implies `client`. | yes |
+| `client` | The upstream side over net-io and http-net: connections, the connection pool, the forwarder, the health checker. Implies `std`. | yes |
+| `std` | Integration with the standard library. Without it the crate needs only `alloc` and 64-bit atomics. | yes |
 
 **Feature Recommendations**:
-- **Checking a configuration or driving the core**: the defaults.
+- **A proxy in front of servers**: the defaults.
+- **Another inbound engine driving the forwarder**: `default-features = false, features = ["client"]`.
 - **Embedding the core on `no_std`**: `default-features = false`.
 
-Forwarding over real sockets (`client` and `serve`) arrives in 0.4, and TLS and WebSocket (`tls`, `ws`) in 0.5.
+TLS and WebSocket (`tls`, `ws`) arrive in 0.5.
 
 ---
 
@@ -123,14 +126,39 @@ Forwarding over real sockets (`client` and `serve`) arrives in 0.4, and TLS and 
 
 ## Quick Start
 
-From 0.4, one line forwards a listener to a set of servers:
+One line forwards a listener to a set of servers:
 
-```rust,ignore
+```rust,no_run
 let running = proxy_net::proxy("0.0.0.0:8080", ["10.0.0.1:80", "10.0.0.2:80"])?;
 running.wait();
+# Ok::<(), proxy_net::ProxyError>(())
 ```
 
-In 0.3, a configuration is built and checked, and its route table answers which pool a request goes to:
+### **Pools, routes, and health checks**
+
+```rust,no_run
+use std::time::Duration;
+use proxy_net::{Balance, HealthCheck, Pool, ProxyBuilder, Route};
+
+let running = ProxyBuilder::new()
+    .pool("api", Pool::new(["10.0.0.1:8080", "10.0.0.2:8080"])
+        .balance(Balance::LeastConnections)
+        .health(HealthCheck::http("/health").interval(Duration::from_secs(2))))
+    .pool("web", Pool::new(["10.0.1.1:8080"]))
+    .route(Route::host("api.example.com").path("/v1").to("api").strip_prefix("/v1"))
+    .route(Route::any().to("web"))
+    .build()?
+    .serve("0.0.0.0:8080")?;
+for pool in running.handle().health().pools {
+    println!("{}: {} endpoints", pool.name, pool.endpoints.len());
+}
+running.wait();
+# Ok::<(), proxy_net::ProxyError>(())
+```
+
+### **Checking a configuration**
+
+A configuration is built and checked without starting anything, and its route table answers which pool a request goes to:
 
 ```rust
 use proxy_net::core::RouteMatch;
@@ -184,9 +212,9 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 
 ---
 
-## **Status: Core**
+## **Status: Forwarding**
 
-**Current Version:** `0.3.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in. The configuration surface and the sans-IO core are built: balancing, health, the retry budget, request checks, head rewriting, and the forwarding state machine. Nothing forwards traffic over sockets yet.
+**Current Version:** `0.4.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in. proxy-net forwards real traffic: the serve-net service, the upstream connection pool, retries within a budget, timeouts, active and passive health, the observer, and `proxy_net::proxy`.
 
 **Target:** `1.0.0`, after the roadmap in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
@@ -198,9 +226,9 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 - **Balancing** - round robin, least connections, power of two choices, Maglev consistent hashing with a load bound, random, first healthy, with tiers and a panic threshold.
 - **Health** - passive ejection with growing back-off and a cap on how much of a pool is ejected, active check results, draining.
 - **Forwarding decisions** - request checks, head rewriting with forwarding headers and `Via`, retries within a budget, and the exchange state machine with every timeout.
+- **Forwarding** - the serve-net service, request bodies held when small and streamed when large, responses streamed with backpressure, pooled upstream connections checked before reuse, the active health checker, an observer, and health and counter snapshots.
 
 **What's planned**:
-- `0.4.0`: forwarding over real sockets through serve-net, the upstream connection pool, and `proxy_net::proxy`.
 - `0.5.0`: WebSocket, TLS and the PROXY protocol to upstreams, live reload, and service discovery.
 
 **Performance targets** (to be measured by committed benchmarks before 1.0.0):
@@ -227,6 +255,18 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 - **[Crate Registry](https://crates.io/crates/proxy-net)** - crates.io
 - **[serve-net](https://github.com/jamesgober/serve-net)** - the server engine proxy-net runs on
 - **[http-net](https://github.com/jamesgober/http-net)** - the HTTP/1.1 engine that parses and writes every message
+
+### **Troubleshooting forwarding**
+
+<details>
+  <summary><b>A mounted <code>ProxyService</code> stalls other connections?</b></summary>
+    <p>The service waits on the upstream inside serve-net's call, so it needs blocking workers (<code>Workers::blocking</code>) until serve-net can park a streamed reply. <code>Proxy::serve</code> and <code>proxy_net::proxy</code> set them for you.</p>
+</details>
+
+<details>
+  <summary><b>Uploads over 1 MiB are refused in my own serve-net server?</b></summary>
+    <p>serve-net's default body limit is 1 MiB. Raise it to at least <code>Limits::max_request_body</code> (<code>serve_net::Limits::default().max_body(..)</code>), as <code>Proxy::serve</code> does.</p>
+</details>
 
 ### **Common Use Cases**
 - **One binary in front of several servers**: one pool, round robin, passive health
@@ -270,8 +310,8 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 - **Edition**: 2024
 - **`no_std`**: the configuration types and the core need only `alloc` and 64-bit atomics; CI builds the crate for `aarch64-unknown-none`
 - **API Stability**: pre-1.0. The API is locked from 0.2; changes come with a migration note
-- **Dependencies**: `parse-net` (first-party) only
-- **Feature Flags**: `std` (default); `client`, `serve`, `tls`, and `ws` arrive in later versions
+- **Dependencies**: first-party only: `parse-net`, and with the default features `http-net`, `net-io`, and `serve-net`
+- **Feature Flags**: `serve`, `client`, `std` (all default); `tls` and `ws` arrive in 0.5
 
 ### **Development Setup**
 ```bash

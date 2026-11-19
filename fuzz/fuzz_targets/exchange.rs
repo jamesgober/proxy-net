@@ -109,12 +109,19 @@ fuzz_target!(|input: Input| {
     let (mut now, mut endings, mut relayed) = (0u64, 0, false);
     for (e, dt) in input.events {
         now = now.saturating_add(u64::from(dt) * 1_000_000);
-        let a = ex.on(e.get(), Tick(now));
+        let event = e.get();
+        let a = ex.on(event, Tick(now));
         match a {
             Action::Relay { .. } => relayed = true,
             Action::Retry { .. } => {
                 assert!(!relayed);
-                assert!(method == b"GET" || method == b"PUT");
+                // A non-idempotent method retries only from a failure while
+                // connecting (the request never left).
+                assert!(
+                    method == b"GET"
+                        || method == b"PUT"
+                        || matches!(event, Event::ConnectFailed(_) | Event::Tick)
+                );
                 assert!(input.replayable);
             }
             Action::Finish { .. } => endings += 1,

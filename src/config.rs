@@ -46,6 +46,35 @@ pub struct ProxyBuilder {
     strip: Vec<Box<str>>,
     via: Option<Option<Box<str>>>,
     frame_facts: bool,
+    hash_key: [u8; 16],
+    #[cfg(feature = "client")]
+    extras: crate::observe::Extras,
+}
+
+#[cfg(feature = "client")]
+impl ProxyBuilder {
+    pub(crate) fn extras_mut(&mut self) -> &mut crate::observe::Extras {
+        &mut self.extras
+    }
+
+    /// The observer and connector, defaults filled in.
+    pub(crate) fn parts(
+        &self,
+    ) -> (
+        alloc::sync::Arc<dyn crate::observe::Observer>,
+        alloc::sync::Arc<dyn crate::client::Connector>,
+    ) {
+        (
+            self.extras
+                .observer
+                .clone()
+                .unwrap_or_else(|| alloc::sync::Arc::new(crate::observe::NoObserver)),
+            self.extras
+                .connector
+                .clone()
+                .unwrap_or_else(|| alloc::sync::Arc::new(crate::client::TcpConnector::new())),
+        )
+    }
 }
 
 impl ProxyBuilder {
@@ -123,6 +152,20 @@ impl ProxyBuilder {
     /// ```
     pub fn frame_facts(mut self, on: bool) -> ProxyBuilder {
         self.frame_facts = on;
+        self
+    }
+
+    /// The key consistent hashing uses for request keys (cookies, headers,
+    /// paths, client addresses). Default all zero, so every node agrees with
+    /// no setting; set the same secret key on every node to make the mapping
+    /// of keys to endpoints unpredictable from outside.
+    ///
+    /// ```
+    /// let b = proxy_net::ProxyBuilder::new().hash_key(*b"0123456789abcdef");
+    /// # let _ = b;
+    /// ```
+    pub fn hash_key(mut self, key: [u8; 16]) -> ProxyBuilder {
+        self.hash_key = key;
         self
     }
 
@@ -224,6 +267,7 @@ impl ProxyBuilder {
             stripped: stripped.into_boxed_slice(),
             via,
             frame_facts: self.frame_facts,
+            hash_key: self.hash_key,
         })
     }
 }
@@ -249,6 +293,7 @@ pub struct Config {
     stripped: Box<[Box<str>]>,
     via: Option<Box<str>>,
     frame_facts: bool,
+    hash_key: [u8; 16],
 }
 
 impl Config {
@@ -302,6 +347,11 @@ impl Config {
     /// Whether upstream requests carry the `proxy-frame` field.
     pub fn frame_facts(&self) -> bool {
         self.frame_facts
+    }
+
+    /// The consistent-hashing key.
+    pub fn hash_key(&self) -> [u8; 16] {
+        self.hash_key
     }
 }
 

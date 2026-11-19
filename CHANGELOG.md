@@ -13,6 +13,48 @@
 
 ---
 
+## [0.4.0] - 2026-11-19
+
+Forwarding over real sockets.
+
+### Added
+
+- `proxy_net::proxy(listen, upstreams)`: one line puts a listener in front of
+  a set of servers.
+- `ProxyBuilder::build` starts a `Proxy`: a balancer, health table, retry
+  budget, and connection pool per pool, and one health checker thread.
+  `Proxy::serve` runs it on serve-net; `Proxy::service` gives the serve-net
+  `HttpService` to mount in a server of your own; `Running` drains or waits.
+- `ProxyService`: routes and checks each request before admission (404, 421,
+  400, 405, 508), holds a small request body before taking an upstream
+  connection, streams a larger one, and streams the response back with
+  backpressure.
+- The upstream side, `proxy_net::client`: the `Connector` and `UpstreamIo`
+  seam, `TcpConnector` over net-io, a connection pool per endpoint (a probe
+  before every reuse, idle and age limits, fresh connections for
+  non-idempotent requests, caps with a bounded wait), and `Forward`, which
+  drives the core's exchange state machine against real connections.
+- The active health checker: HTTP or TCP checks on a schedule with jitter,
+  ejections ended on time, and idle connections closed past their limit.
+- `Observer` with a method per event, `ProxyHandle::health` and `stats`
+  snapshots, and `ProxyBuilder::hash_key` for consistent hashing.
+- Bytes left after a complete upstream response close the connection and
+  count against the endpoint (a desync tripwire).
+- Socket tests and attack tests (smuggling vectors, requests hidden in
+  bodies, slow clients), loom model checks of the health table and retry
+  budget, and a fuzz target for whole exchanges against arbitrary upstream
+  responses.
+
+### Changed
+
+- A failure while connecting (the request never left the proxy) is now
+  retried for any method whose body is held; once a request may have
+  reached the upstream, only idempotent methods are retried, as before.
+- The upstream's `Date` field is dropped from responses (serve-net writes
+  its own).
+
+---
+
 ## [0.3.0] - 2026-11-19
 
 The sans-IO core: every forwarding decision, without sockets, threads, or
@@ -108,7 +150,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/proxy-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/proxy-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/proxy-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/proxy-net/releases/tag/v0.1.0

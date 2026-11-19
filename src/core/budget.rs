@@ -1,9 +1,7 @@
 //! The retry budget: retries in flight stay a bounded share of the pool's
 //! active exchanges, so a failing pool cannot multiply its own load.
 
-use core::sync::atomic::{AtomicU32, Ordering};
-
-use super::atomic::update_u32;
+use super::atomic::{AtomicU32, Ordering, update_u32};
 use crate::pool::Retry;
 
 /// True for the idempotent methods of RFC 9110 9.2.2: `GET`, `HEAD`,

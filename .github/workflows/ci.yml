@@ -71,6 +71,20 @@ jobs:
       - name: Build the library for a target without std
         run: cargo build --lib --no-default-features --target aarch64-unknown-none
 
+  loom:
+    name: loom (model-checked concurrency)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The balancers, health table, and retry budget under every interleaving
+      # loom finds.
+      - name: Run the loom tests
+        run: cargo test --release --no-default-features --test loom
+        env:
+          RUSTFLAGS: "--cfg proxy_net_loom"
+
   fuzz:
     name: Fuzz smoke (60 s per target)
     runs-on: ubuntu-latest
@@ -83,7 +97,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          [endpoint, route_pattern, route_match, path_check, request_fields, exchange]
+          [endpoint, route_pattern, route_match, path_check, request_fields, exchange, upstream_response]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master

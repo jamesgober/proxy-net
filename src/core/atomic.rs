@@ -3,7 +3,10 @@
 //! `fetch_update` is deprecated on newer toolchains in favour of a method the
 //! MSRV does not have, so the loop is written out once here.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(not(proxy_net_loom))]
+pub(crate) use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(proxy_net_loom)]
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Applies `f` until the swap succeeds; `Err(current)` when `f` returns
 /// `None`, `Ok(previous)` otherwise.

@@ -2,7 +2,7 @@
 
 > The design, strategy, and decision record for `proxy-net`. A living document: every design decision, idea, or open question about proxy-net is written here or in [`ROADMAP.md`](./ROADMAP.md) before it is acted on.
 >
-> **Status:** `0.3.0`, the sans-IO core (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
+> **Status:** `0.4.0`, forwarding (2026-11-19). The API contract is [`../docs/API.md`](../docs/API.md).
 
 ---
 
@@ -66,10 +66,10 @@ Every threat gets an attack test named after it, in the version that ships its d
 
 | Crate | Version | Why | From |
 |---|---|---|---|
-| http-net | 0.10 | upstream request writing and response parsing, hop-by-hop helpers | 0.3 |
+| http-net | 0.10 | upstream request writing and response parsing (`ClientConn`) | 0.4 (added) |
 | parse-net | 0.7 (the version http-net 0.10 pins) | `Forwarded` writing and parsing, list parsing (`Connection`, `Via`) | 0.3 (added) |
-| net-io | 0.8 | outbound connections, PROXY encoders | 0.4 |
-| serve-net | 0.8 | the inbound side | 0.4 |
+| net-io | 0.8.1 | outbound connections and their deadlines, PROXY encoders (from 0.5) | 0.4 (added) |
+| serve-net | 0.8.2 | the inbound side | 0.4 (added) |
 | tls-net | 0.10 | TLS to upstreams (feature `tls`) | 0.5 |
 | ws-net | 0.10 | the WebSocket bridge (feature `ws`) | 0.5 |
 
@@ -149,3 +149,12 @@ Each gap has a fallback here, so proxy-net never waits on it.
 | D-031 | 2026-11-19 | Property tests use proptest (dev-dependency only) | standard 2.11; the resolver picks a release that builds on 1.85 |
 | D-032 | 2026-11-19 | Idea I-1 ships as `frame_facts` (off by default), and a client's `proxy-frame` is always removed | a framing statement a client could forge would be worse than none |
 | D-033 | 2026-11-19 | With the default ejection cap (50%), a pool of one endpoint is never ejected | ejecting the only endpoint refuses everything; the panic threshold would send traffic to it anyway |
+| D-034 | 2026-11-19 | A failure while connecting is retried for any method whose body is held; after the request may have left, only idempotent methods retry | the request never reached the upstream, so a retry cannot duplicate it; without this, every POST to a dead endpoint fails until ejection |
+| D-035 | 2026-11-19 | The serve-net service keeps each request's exchange in a thread-local slot keyed by connection and request number | blocking workers serve one connection per thread, so the slot needs no lock; it is cleared in `done` on every path |
+| D-036 | 2026-11-19 | One mutex and condition variable per endpoint for its idle connections and caps, not sharded yet | the lock is held only to push or pop (never across I/O); sharding waits for 0.6 numbers |
+| D-037 | 2026-11-19 | `Connector::connect` returns `Box<dyn UpstreamIo>` | one allocation per new connection, not per request, and the proxy type stays free of a connector parameter |
+| D-038 | 2026-11-19 | The upstream's `Date` is dropped; serve-net writes its own | two `Date` fields would be invalid; the proxy is the sender the client sees |
+| D-039 | 2026-11-19 | A response with more than 64 fields answers 502 | serve-net 0.8 writes at most 64 reply fields (G-4); an incomplete response would be worse |
+| D-040 | 2026-11-19 | Model checks run under `--cfg proxy_net_loom`, with loom only as a cfg-gated dependency | the atomics come through one module (`core::atomic`), so loom swaps them without touching the code; a normal build never sees loom |
+| D-041 | 2026-11-19 | `Proxy::serve` and `proxy` start serve-net with 256 blocking workers and the body limit raised to `max_request_body` | the service blocks on the upstream (G-1), and serve-net's default 1 MiB body limit would cut uploads short |
+| D-042 | 2026-11-19 | Slow start moves from 0.4 to 0.5 | round robin walks a schedule built once; changing weights over time means rebuilding it, which the 0.5 reload work does anyway. It is off by default, so no behaviour changes in the meantime |

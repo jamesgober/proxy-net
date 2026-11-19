@@ -15,7 +15,7 @@
 <br>
 
 > Every public item of `proxy-net`: what it does, its parameters, its errors,
-> and examples. **Version `0.3.0`, the sans-IO core.** This file is the API
+> and examples. **Version `0.4.0`, forwarding.** This file is the API
 > contract: items marked *shipped* are in this build; items marked with a
 > later version are the locked shape of what comes next, and their names and
 > signatures change only with a migration note.
@@ -29,7 +29,18 @@
   - [Versions](#versions)
   - [Features](#features)
 - [Tier 1](#tier-1)
-  - [`proxy`](#proxy) (0.4)
+  - [`proxy`](#proxy)
+- [The running proxy](#the-running-proxy)
+  - [`ProxyBuilder::build`, `observer`, `connector`](#proxybuilderbuild-observer-connector)
+  - [`Proxy`](#proxy-1)
+  - [`Running`](#running)
+  - [`ProxyHandle`, `HealthSnapshot`, `ProxyStats`](#proxyhandle-healthsnapshot-proxystats)
+  - [`Observer`, `NoObserver`, `Finished`](#observer-noobserver-finished)
+  - [`ProxyService`](#proxyservice)
+  - [`ProxyError`](#proxyerror)
+- [The upstream side (`proxy_net::client`)](#the-upstream-side-proxy_netclient)
+  - [`Connector`, `UpstreamIo`, `TcpConnector`](#connector-upstreamio-tcpconnector)
+  - [`Forward`, `RequestParts`, `ResponseStart`, `Failure`](#forward-requestparts-responsestart-failure)
 - [Configuration](#configuration)
   - [`ProxyBuilder`](#proxybuilder)
   - [`Config`](#config)
@@ -93,7 +104,7 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 |---|---|
 | 0.2.0 | the configuration surface, built and checked (this file's *shipped* items) |
 | 0.3.0 | the sans-IO core: balancing, health, retry accounting, head rewriting, path safety, loop detection, the exchange state machine (*shipped*) |
-| 0.4.0 | forwarding over real sockets: the serve-net service, the upstream client and connection pool, active health checks, Tier 1 |
+| 0.4.0 | forwarding over real sockets: the serve-net service, the upstream client and connection pool, active health checks, Tier 1 (*shipped*) |
 | 0.5.0 | WebSocket bridge, TLS and the PROXY protocol to upstreams, live reload, discovery |
 
 ### Features
@@ -101,8 +112,8 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 | Feature | Default | What it adds |
 |---|---|---|
 | `std` | yes | `std` integration. Without it the crate needs only `alloc`. |
-| `client` | yes, from 0.4 | the upstream side over net-io |
-| `serve` | yes, from 0.4 | the serve-net service and Tier 1 |
+| `client` | yes | the upstream side over net-io and http-net: connections, the pool, the forwarder, the health checker |
+| `serve` | yes | the serve-net service, `Proxy::serve`, and Tier 1 |
 | `tls` | no, from 0.5 | TLS to upstreams through tls-net |
 | `ws` | no, from 0.5 | the WebSocket bridge through ws-net |
 
@@ -112,7 +123,7 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 
 ### `proxy`
 
-*0.4.0.* Listens on `listen` and forwards every request to the given endpoints: one pool, round robin, passive health, the default limits and timeouts, and forwarding headers in both styles.
+*Shipped (0.4, feature `serve`).* Listens on `listen` and forwards every request to the given endpoints: one pool, round robin, passive health, the default limits and timeouts, and forwarding headers in both styles.
 
 ```rust,ignore
 pub fn proxy<A, I, S>(listen: A, upstreams: I) -> Result<Running, ProxyError>
@@ -122,12 +133,239 @@ where
     S: AsRef<str>;
 ```
 
-```rust,ignore
+```rust,no_run
 let running = proxy_net::proxy("0.0.0.0:8080", ["10.0.0.1:80", "10.0.0.2:80"])?;
 running.wait();
+# Ok::<(), proxy_net::ProxyError>(())
 ```
 
 Errors: `ProxyError::Config` (an endpoint does not parse), `ProxyError::Serve` (the listener could not be bound).
+
+---
+
+## The running proxy
+
+### `ProxyBuilder::build`, `observer`, `connector`
+
+*Shipped (0.4, feature `client`).*
+
+```rust,ignore
+impl ProxyBuilder {
+    pub fn build(self) -> Result<Proxy, ProxyError>;
+    pub fn observer(self, observer: impl Observer) -> ProxyBuilder;
+    pub fn connector(self, connector: impl Connector) -> ProxyBuilder;   // default TcpConnector
+}
+```
+
+`build` checks the configuration as `config` does, then starts the running state: a balancer, a health table, a retry budget, and a connection pool per pool, and one health checker thread. The checker runs the active checks, ends ejections whose time has come, and closes idle connections past `PoolLimits::idle_timeout`; it sleeps until the next one is due.
+
+```rust,no_run
+let proxy = proxy_net::ProxyBuilder::new()
+    .pool("app", proxy_net::Pool::new(["127.0.0.1:3000", "127.0.0.1:3001"]))
+    .build()?;
+let running = proxy.serve("127.0.0.1:8080")?;
+running.wait();
+# Ok::<(), proxy_net::ProxyError>(())
+```
+
+Errors: `ProxyError::Config`; `ProxyError::Io` when the checker thread cannot start.
+
+### `Proxy`
+
+*Shipped (0.4, feature `client`; `service` and `serve` with `serve`).*
+
+```rust,ignore
+impl Proxy {
+    pub fn handle(&self) -> ProxyHandle;
+    pub fn config(&self) -> &Config;
+    pub fn service(&self) -> ProxyService;                                  // feature `serve`
+    pub fn serve<A: ToSocketAddrs>(self, listen: A) -> Result<Running, ProxyError>; // feature `serve`
+    pub fn forward(&self, route: usize, parts: RequestParts) -> Option<Forward>;
+    pub fn hash(&self, pool: usize, bytes: &[u8]) -> Option<u64>;
+}
+```
+
+- `serve` starts a serve-net server on `listen` with 256 blocking workers and the body limit raised to `Limits::max_request_body`, and mounts the proxy's service.
+- `service` gives the serve-net `HttpService` to mount in a server of your own. Give that server blocking workers (`Workers::blocking`) and a body limit at least `Limits::max_request_body`: until serve-net can park a streamed reply, the proxy waits on the upstream inside the service.
+- `forward` starts one exchange for another inbound engine; see [`Forward`](#forward-requestparts-responsestart-failure).
+- Dropping the `Proxy` stops the checker and closes the idle connections.
+
+### `Running`
+
+*Shipped (0.4, feature `serve`).* The proxy serving a listener.
+
+```rust,ignore
+impl Running {
+    pub fn local_addr(&self) -> Option<SocketAddr>;
+    pub fn handle(&self) -> ProxyHandle;
+    pub fn drain(self, within: Duration) -> serve_net::DrainReport;  // stop accepting, finish exchanges, stop
+    pub fn wait(self) -> serve_net::DrainReport;                    // until a signal or a drain from elsewhere
+}
+```
+
+### `ProxyHandle`, `HealthSnapshot`, `ProxyStats`
+
+*Shipped (0.4, feature `client`).* Snapshots, read without locks except the connection counts (one short lock per endpoint).
+
+```rust,ignore
+impl ProxyHandle {
+    pub fn health(&self) -> HealthSnapshot;
+    pub fn stats(&self) -> ProxyStats;
+    pub fn balancer(&self, pool: usize) -> Option<&Balancer>;
+}
+pub struct HealthSnapshot { pub pools: Vec<PoolHealth> }
+pub struct PoolHealth { pub name: Box<str>, pub endpoints: Vec<EndpointHealth> }
+pub struct EndpointHealth { pub addr: EndpointAddr, pub state: EndpointState, pub eligible: bool,
+                            pub active: u32, pub open: u32, pub idle: u32, pub latency_ns: u64 }
+pub struct ProxyStats { pub exchanges: u64, pub succeeded: u64, pub failed: u64, pub retries: u64,
+                        pub refused: u64, pub desyncs: u64 }
+```
+
+```rust,no_run
+let running = proxy_net::proxy("127.0.0.1:8080", ["127.0.0.1:3000"])?;
+for pool in running.handle().health().pools {
+    for e in pool.endpoints {
+        println!("{} {}: {:?}, {} active, {} idle", pool.name, e.addr, e.state, e.active, e.idle);
+    }
+}
+# Ok::<(), proxy_net::ProxyError>(())
+```
+
+### `Observer`, `NoObserver`, `Finished`
+
+*Shipped (0.4, feature `client`).* One method per event, each with an empty default; methods run on the exchange's thread, so keep them short.
+
+| Method | When |
+|---|---|
+| `route_matched(route, pool)` | a request matched a route |
+| `endpoint_picked(pool, endpoint, attempt)` | the balancer picked an endpoint |
+| `connected(endpoint, took, reused)` | a connection is ready, pooled or new |
+| `retry(endpoint, class, attempt)` | an attempt failed and the exchange retries |
+| `response_head(endpoint, status, waited)` | the response head arrived |
+| `finished(&Finished)` | an exchange ended (each exactly once) |
+| `health_changed(pool, endpoint, from, to)` | an endpoint's health changed |
+| `refused(class)` | a request was refused before forwarding |
+| `desync(endpoint, leftover)` | an upstream left bytes after a complete response |
+
+`Finished` carries the route, pool, endpoint, status, failure class, attempts, bytes up and down, and the time it took.
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use proxy_net::{EndpointAddr, Observer};
+
+#[derive(Default)]
+struct Retries(AtomicU64);
+impl Observer for Retries {
+    fn retry(&self, _e: &EndpointAddr, _c: proxy_net::core::ErrorClass, _attempt: u8) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+let builder = proxy_net::ProxyBuilder::new().observer(Retries::default());
+# let _ = builder;
+```
+
+### `ProxyService`
+
+*Shipped (0.4, feature `serve`).* The serve-net `HttpService`.
+
+- `head`: matches the route (404, or `UnknownHost`'s status), refuses a loop (508), runs `check_request` (400 or 405), and asks serve-net to stream the body.
+- `call`: holds the first `Limits::request_buffer` bytes of the body, then forwards; when the body is complete, waits for the response head (with retries), then relays the body in parts of up to `Limits::relay_buffer`, called again only once the client took the last part.
+- A failure before any response byte answers with its status (`Retry-After: 1` with 503); after that, the client connection is closed.
+- The upstream's `Date` is dropped (serve-net writes its own), and a response with more than 64 fields is answered 502 (serve-net 0.8 writes at most 64).
+
+### `ProxyError`
+
+*Shipped (0.4).* `Config(ConfigError)`, `Serve(serve_net::ServeError)` (feature `serve`), `Io(std::io::Error)`.
+
+---
+
+## The upstream side (`proxy_net::client`)
+
+Feature `client`.
+
+### `Connector`, `UpstreamIo`, `TcpConnector`
+
+*Shipped (0.4).* The transport seam.
+
+```rust,ignore
+pub trait Connector: Send + Sync + 'static {
+    fn connect(&self, endpoint: &EndpointAddr, prelude: &[u8], deadline: Instant)
+        -> Result<Box<dyn UpstreamIo>, ErrorClass>;
+}
+pub trait UpstreamIo: Send + 'static {
+    fn send(&mut self, bytes: &[u8], deadline: Instant) -> Result<(), ErrorClass>;
+    fn recv(&mut self, buf: &mut [u8], deadline: Instant, kind: TimeoutKind) -> Result<usize, ErrorClass>;
+    fn is_reusable(&mut self) -> bool;   // probe before reuse
+    fn close(&mut self);
+}
+```
+
+`TcpConnector` connects through net-io (the system resolver for host names, happy eyeballs when a name has several addresses) with net-io's own phase timeouts out of the way, so every call's deadline decides; the minimum transfer rate is off, since an upstream may trickle a long response. `prelude` is sent first (the PROXY header from 0.5).
+
+```rust
+use std::time::Instant;
+use proxy_net::client::{Connector, UpstreamIo};
+use proxy_net::core::{ErrorClass, TimeoutKind};
+use proxy_net::EndpointAddr;
+
+/// Answers every request with a fixed response (for tests).
+struct Fixed;
+struct FixedConn(Vec<u8>);
+impl UpstreamIo for FixedConn {
+    fn send(&mut self, _b: &[u8], _d: Instant) -> Result<(), ErrorClass> { Ok(()) }
+    fn recv(&mut self, buf: &mut [u8], _d: Instant, _k: TimeoutKind) -> Result<usize, ErrorClass> {
+        let n = self.0.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.0[..n]);
+        self.0.drain(..n);
+        Ok(n)
+    }
+    fn is_reusable(&mut self) -> bool { false }
+    fn close(&mut self) {}
+}
+impl Connector for Fixed {
+    fn connect(&self, _e: &EndpointAddr, _p: &[u8], _d: Instant) -> Result<Box<dyn UpstreamIo>, ErrorClass> {
+        Ok(Box::new(FixedConn(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec())))
+    }
+}
+let proxy = proxy_net::ProxyBuilder::new()
+    .pool("app", proxy_net::Pool::new(["10.0.0.1:80"]))
+    .connector(Fixed)
+    .build()?;
+let mut forward = proxy
+    .forward(0, proxy_net::client::RequestParts { method: "GET".into(), target: "/".into(), ..Default::default() })
+    .expect("route 0");
+forward.push_body(b"", true).expect("body");
+let head = forward.response().expect("response");
+assert_eq!(head.status, 200);
+let mut body = Vec::new();
+while !forward.read_body(&mut body, 4096).expect("body") {}
+assert_eq!(body, b"ok");
+# Ok::<(), proxy_net::ProxyError>(())
+```
+
+### `Forward`, `RequestParts`, `ResponseStart`, `Failure`
+
+*Shipped (0.4).* One request being forwarded, driven by the caller's thread (it blocks on the upstream).
+
+```rust,ignore
+pub struct RequestParts { pub method: Box<str>, pub target: Box<str>, pub host: Box<[u8]>,
+                          pub fields: Vec<(Box<str>, Box<[u8]>)>, pub client: Option<SocketAddr>,
+                          pub https: bool, pub body: BodyFacts, pub key: Option<u64> }
+impl Forward {
+    pub fn push_body(&mut self, bytes: &[u8], last: bool) -> Result<(), Failure>;
+    pub fn response(&mut self) -> Result<ResponseStart, Failure>;
+    pub fn read_body(&mut self, out: &mut Vec<u8>, max: usize) -> Result<bool, Failure>; // true: ended
+    pub fn abandon(&mut self);   // the client went away
+}
+pub struct ResponseStart { pub status: u16, pub fields: FieldList, pub has_body: bool }
+pub struct Failure { pub class: ErrorClass, pub status: Option<u16> }
+```
+
+- The body: the first `Limits::request_buffer` bytes are held before any upstream connection is taken. A body that ends within that is replayable, so the exchange may retry; a larger one goes upstream at once and streams, and is not retried.
+- Connections: a pooled connection is reused only after its probe says it is open with nothing waiting, while it is younger than `PoolLimits::idle_timeout` and has carried fewer than `max_exchanges_per_connection`. A non-idempotent request takes only a connection used within `fresh_for`, so the keep-alive close race cannot lose it.
+- When every connection place of an endpoint is taken, a request waits up to `pending_timeout` (at most `max_pending` waiters), then fails with `Breaker` (503).
+- Bytes left after a complete response close the connection, count as a desync, and count against the endpoint's health.
+- Dropping a `Forward` that did not finish abandons it: its connection is closed, never reused.
 
 ---
 
@@ -149,10 +387,10 @@ impl ProxyBuilder {
     pub fn via(self, pseudonym: &str) -> ProxyBuilder;
     pub fn no_via(self) -> ProxyBuilder;
     pub fn frame_facts(self, on: bool) -> ProxyBuilder;   // 0.3.0
+    pub fn hash_key(self, key: [u8; 16]) -> ProxyBuilder; // 0.4.0
     pub fn check(&self) -> Result<(), ConfigError>;
     pub fn config(self) -> Result<Config, ConfigError>;
-    // 0.4.0: pub fn build(self) -> Result<Proxy, ConfigError>;
-    // 0.4.0: pub fn observer(self, observer: impl Observer) -> ProxyBuilder;
+    // 0.4.0, feature `client`: build, observer, connector (see The running proxy)
 }
 ```
 
@@ -166,6 +404,7 @@ impl ProxyBuilder {
 | `strip_header` | adds a field to the set removed from every request (the forwarding set is always removed) |
 | `via` | the pseudonym written in `Via` and used for loop detection (default `proxy-net`, a token of at most 64 bytes) |
 | `no_via` | no `Via`, no loop detection |
+| `hash_key` | the key consistent hashing uses for request keys; all zero by default, so every node agrees with no setting; set the same secret on every node to make the mapping unpredictable from outside |
 | `frame_facts` | add a `proxy-frame` field stating how the proxy framed each upstream request (`length=N`, `chunked`, or `none`, and the field count), so an upstream that reads it can detect a framing disagreement; off by default. A client's `proxy-frame` is always removed |
 | `check` | `config` without consuming the builder |
 | `config` | checks everything and returns the validated [`Config`](#config) |
@@ -214,6 +453,7 @@ impl Config {
     pub fn stripped_headers(&self) -> impl Iterator<Item = &str>;
     pub fn via(&self) -> Option<&str>;
     pub fn frame_facts(&self) -> bool;
+    pub fn hash_key(&self) -> [u8; 16];
 }
 ```
 
@@ -729,7 +969,9 @@ assert_eq!(start.after(Duration::from_millis(5)).since(start), Duration::from_mi
 ```rust,ignore
 impl Balancer {
     pub fn new(pool: &PoolConfig) -> Balancer;
-    pub fn key(bytes: &[u8]) -> u64;                       // hash of a request key
+    pub fn with_key(pool: &PoolConfig, key: [u8; 16]) -> Balancer;
+    pub fn key(bytes: &[u8]) -> u64;                       // hash of a request key, default key
+    pub fn hash(&self, bytes: &[u8]) -> u64;               // hash of a request key, this balancer's key
     pub fn refresh(&self, health: &HealthTable) -> usize;  // returns the number eligible
     pub fn pick(&self, key: Option<u64>, exclude: &[EndpointId]) -> Option<EndpointId>;
     pub fn started(&self, id: EndpointId);
@@ -956,7 +1198,8 @@ pub enum Action { Pick { attempt }, Connect { endpoint, deadline }, Send { deadl
 
 Rules the machine holds (each covered by property tests and a fuzz target):
 
-- a retry is offered only for an idempotent method whose body is held (`replayable`), before any response byte was relayed, after a retryable failure (connect, TLS, a reset before the response, a connect timeout, or a status in `Retry::on_status`), and within `Retry::attempts`; the caller asks the budget and answers `RetryGranted` or `RetryDenied`;
+- a retry is offered only when the body is held (`replayable`), before any response byte was relayed, after a retryable failure (connect, TLS, a reset before the response, a connect timeout, or a status in `Retry::on_status`), and within `Retry::attempts`; the caller asks the budget and answers `RetryGranted` or `RetryDenied`;
+- a failure while connecting is retried for any method, since the request never left the proxy (0.4); once the request may have reached the upstream, only idempotent methods are retried;
 - a timeout after the request was sent is never retried: the upstream may still be working on it;
 - a retry to an endpoint already tried waits `Retry::backoff` first;
 - `Finish { reuse: true }` only after the whole response, with no response before the request was sent in full;
@@ -971,10 +1214,12 @@ let config = ProxyBuilder::new().pool("app", Pool::new(["10.0.0.1:80"])).config(
 let mut ex = Exchange::new(b"POST", true, config.pool("app").expect("pool"), Tick(0));
 let _ = ex.on(Event::Start, Tick(0));
 let _ = ex.on(Event::Picked(EndpointId(0)), Tick(0));
-// A POST is never sent twice: a failed connect ends the exchange with 502.
+let _ = ex.on(Event::Connected, Tick(0));
+let _ = ex.on(Event::Sent, Tick(0));
+// A POST is never sent twice: a reset after it went out ends the exchange with 502.
 assert_eq!(
-    ex.on(Event::ConnectFailed(ErrorClass::Connect), Tick(1)),
-    Action::Fail { class: ErrorClass::Connect, status: Some(502) },
+    ex.on(Event::UpstreamFailed(ErrorClass::UpstreamReset), Tick(1)),
+    Action::Fail { class: ErrorClass::UpstreamReset, status: Some(502) },
 );
 # Ok::<(), proxy_net::ConfigError>(())
 ```
@@ -1027,32 +1272,14 @@ assert_eq!(e.to_string(), "no upstream is available (attempt 1)");
 
 ## Planned items
 
-The locked shape of what follows 0.3. Names and signatures here change only with a migration note.
-
-### 0.4.0: forwarding
-
-```rust,ignore
-pub fn proxy(listen, upstreams) -> Result<Running, ProxyError>;
-impl ProxyBuilder {
-    pub fn build(self) -> Result<Proxy, ConfigError>;
-    pub fn observer(self, o: impl Observer) -> ProxyBuilder;
-    pub fn hash_key(self, key: [u8; 16]) -> ProxyBuilder;   // the consistent-hashing key; all zero by default so nodes agree
-}
-impl Proxy { pub fn handle(&self) -> ProxyHandle; pub fn service(&self) -> ProxyService; pub fn serve(self, listen) -> Result<Running, ProxyError>; }
-pub struct Running;                               // handle(), stop(), drain(within), wait(), local_addr()
-pub trait Observer: Send + Sync + 'static { /* one method per event, all with empty defaults */ }
-pub trait Connector { type Conn: UpstreamIo; fn connect(&self, endpoint, prelude, deadline) -> Result<Self::Conn, ForwardError>; }
-pub trait UpstreamIo { fn send(..); fn recv(..); fn is_reusable(&mut self) -> bool; fn close(self); }
-pub struct TcpConnector;
-impl ProxyHandle { pub fn health(&self) -> HealthSnapshot; pub fn stats(&self) -> ProxyStats; }
-pub enum ProxyError { Config(ConfigError), Serve(serve_net::ServeError) }
-```
-
-Until serve-net can park a streamed reply, `ProxyService` needs serve-net's blocking workers; `Proxy::serve` and `proxy` set them.
+The locked shape of what follows 0.4. Names and signatures here change only with a migration note.
 
 ### 0.5.0: feature complete
 
 ```rust,ignore
+impl Endpoint {
+    pub fn slow_start(..);                                         // moved from 0.4 (see dev/ROADMAP.md)
+}
 impl Pool {
     pub fn proxy_protocol(self, version: ProxyProtocol) -> Pool;   // Off, V1, V2 { authority, alpn, unique_id, crc }
     pub fn tls(self, tls: UpstreamTls) -> Pool;                    // roots, pinning, SNI, client certificates

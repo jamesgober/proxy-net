@@ -7,9 +7,8 @@
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use super::atomic::{update_u32, update_u64};
+use super::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, update_u32, update_u64};
 use super::hash::{hash_key, mix};
 use super::health::{EndpointId, HealthTable};
 use crate::pool::{Balance, PoolConfig};
@@ -76,6 +75,7 @@ pub struct Balancer {
     total_active: AtomicU64,
     eligible_count: AtomicU32,
     panic_below: u32,
+    request_key: [u64; 2],
 }
 
 impl core::fmt::Debug for Balancer {
@@ -191,8 +191,16 @@ fn maglev(names: &[Vec<u8>], weights: &[u64]) -> Box<[u16]> {
 
 impl Balancer {
     /// Balancing state for `pool`, with nothing eligible until the first
-    /// [`refresh`](Balancer::refresh).
+    /// [`refresh`](Balancer::refresh). Request keys hash with the all-zero
+    /// key; see [`with_key`](Balancer::with_key).
     pub fn new(pool: &PoolConfig) -> Balancer {
+        Balancer::with_key(pool, [0; 16])
+    }
+
+    /// As [`new`](Balancer::new), hashing request keys with `key` (the
+    /// configuration's `hash_key`). Every node must use the same key to send
+    /// a request key to the same endpoint.
+    pub fn with_key(pool: &PoolConfig, key: [u8; 16]) -> Balancer {
         let endpoints = pool.endpoints();
         let weights: Vec<u64> = endpoints
             .iter()
@@ -239,6 +247,14 @@ impl Balancer {
             total_active: AtomicU64::new(0),
             eligible_count: AtomicU32::new(0),
             panic_below: u32::from(pool.outlier().panic_below_value()),
+            request_key: [
+                u64::from_le_bytes([
+                    key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+                ]),
+                u64::from_le_bytes([
+                    key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15],
+                ]),
+            ],
         }
     }
 
@@ -252,6 +268,22 @@ impl Balancer {
     /// ```
     pub fn key(bytes: &[u8]) -> u64 {
         hash_key(REQUEST_KEY, bytes)
+    }
+
+    /// The hash of a request key with this balancer's key (equal to
+    /// [`key`](Balancer::key) under the default all-zero key).
+    ///
+    /// ```
+    /// use proxy_net::core::Balancer;
+    /// use proxy_net::{Pool, ProxyBuilder};
+    /// let config = ProxyBuilder::new().pool("p", Pool::new(["10.0.0.1:80"])).config()?;
+    /// let pool = config.pool("p").expect("pool");
+    /// assert_eq!(Balancer::new(pool).hash(b"k"), Balancer::key(b"k"));
+    /// assert_ne!(Balancer::with_key(pool, [7; 16]).hash(b"k"), Balancer::key(b"k"));
+    /// # Ok::<(), proxy_net::ConfigError>(())
+    /// ```
+    pub fn hash(&self, bytes: &[u8]) -> u64 {
+        hash_key(self.request_key, bytes)
     }
 
     /// Recomputes the eligible set from `health`: the healthy endpoints of the
