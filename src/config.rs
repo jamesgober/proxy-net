@@ -75,6 +75,11 @@ impl ProxyBuilder {
     }
 
     /// The builder with each pool replaced by `f(name, pool)`.
+    /// True when any pool has a discovery source.
+    pub(crate) fn discovers(&self) -> bool {
+        self.pools.iter().any(|(_, p)| p.discovery_slot().is_some())
+    }
+
     pub(crate) fn map_pools(mut self, mut f: impl FnMut(&str, Pool) -> Pool) -> ProxyBuilder {
         let pools = core::mem::take(&mut self.pools);
         self.pools = pools

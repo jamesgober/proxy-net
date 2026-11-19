@@ -11,9 +11,11 @@ use http_net::{ClientConn, ClientEvent, Request};
 
 use super::pool::{Taken, UpstreamConn};
 use super::runtime::Runtime;
+use super::spare;
 use crate::core::{
-    Action, BodyFacts, EndpointId, ErrorClass, Event, Exchange, FieldList, ForwardFacts, LimitKind,
-    Outcome, RefusalKind, Tick, is_idempotent, request_fields, response_fields,
+    Action, BodyFacts, EndpointId, ErrorClass, Event, Exchange, FieldList, FieldSource,
+    ForwardFacts, LimitKind, Outcome, RefusalKind, Tick, is_idempotent, request_fields_in,
+    response_fields_in,
 };
 use crate::observe::{Counters, Finished};
 
@@ -28,7 +30,7 @@ pub struct RequestParts {
     /// The `Host` value.
     pub host: Box<[u8]>,
     /// The fields as received, in order.
-    pub fields: Vec<(Box<str>, Box<[u8]>)>,
+    pub fields: FieldList,
     /// The client address the inbound engine resolved.
     pub client: Option<SocketAddr>,
     /// The client reached the proxy over TLS.
@@ -103,6 +105,15 @@ pub(crate) fn prelude(
     };
     out.truncate(n.unwrap_or(0));
     out
+}
+
+/// An upstream response head read in place by the rewriting functions.
+struct HeadFields<'h, 'a>(&'h http_net::ResponseHead<'a>);
+
+impl FieldSource for HeadFields<'_, '_> {
+    fn fields(&self) -> impl Iterator<Item = (&str, &[u8])> + '_ {
+        self.0.headers()
+    }
 }
 
 /// The start of the response the client will get.
@@ -194,7 +205,7 @@ impl Forward {
             endpoint: None,
             balanced: None,
             deadline: now,
-            out: Vec::new(),
+            out: spare::bytes(),
             started: now,
             sent_at: now,
             head: None,
@@ -501,7 +512,7 @@ impl Forward {
             Taken::Pooled(conn) => {
                 rt.observer
                     .connected(endpoint.addr(), begun.elapsed(), true);
-                self.conn = Some(*conn);
+                self.conn = Some(conn);
                 Ok(())
             }
             Taken::Dial => match rt.pools[self.pool].connector.connect(
@@ -552,12 +563,6 @@ impl Forward {
         else {
             return Err(Failure::new(ErrorClass::NoEndpoint));
         };
-        let fields: Vec<(&str, &[u8])> = self
-            .parts
-            .fields
-            .iter()
-            .map(|(n, v)| (&**n, &**v))
-            .collect();
         let facts = ForwardFacts::new(
             self.parts.method.as_bytes(),
             self.parts.target.as_bytes(),
@@ -571,16 +576,28 @@ impl Forward {
         .request_id(self.parts.request_id.as_deref())
         .upstream_tls(config.pool_at(self.pool).is_some_and(|p| p.tls().is_some()))
         .body(self.parts.body);
-        let mut list = FieldList::new();
-        let mut target = Vec::new();
-        request_fields(&fields, &facts, route, config, &mut list, &mut target)
-            .map_err(Failure::new)?;
-        let target = String::from_utf8(target)
-            .map_err(|_| Failure::new(ErrorClass::Refused(RefusalKind::InvalidField)))?;
-        let mut request = Request::new(&self.parts.method, &target);
-        for (name, value) in list.iter() {
-            request = request.header(name, value);
-        }
+        let (mut list, mut target) = (spare::list(), spare::bytes());
+        let built = request_fields_in(
+            &self.parts.fields,
+            &facts,
+            route,
+            config,
+            &mut list,
+            &mut target,
+        )
+        .map_err(Failure::new)
+        .and_then(|()| {
+            let target = core::str::from_utf8(&target)
+                .map_err(|_| Failure::new(ErrorClass::Refused(RefusalKind::InvalidField)))?;
+            let mut request = Request::new(&self.parts.method, target);
+            for (name, value) in list.iter() {
+                request = request.header(name, value);
+            }
+            Ok(request)
+        });
+        spare::give_list(list);
+        spare::give_bytes(target);
+        let mut request = built?;
         request = match self.parts.body {
             BodyFacts::Length(n) => request.content_length(n),
             BodyFacts::Chunked => request.chunked(),
@@ -632,9 +649,13 @@ impl Forward {
                 Ok(ClientEvent::Response(head)) => {
                     let status = head.status();
                     self.status = Some(status);
-                    let fields: Vec<(&str, &[u8])> = head.headers().collect();
-                    let mut list = FieldList::new();
-                    response_fields(&fields, route, &rt.config, &mut list)?;
+                    let mut list = spare::list();
+                    if let Err(c) =
+                        response_fields_in(&HeadFields(&head), route, &rt.config, &mut list)
+                    {
+                        spare::give_list(list);
+                        return Err(c);
+                    }
                     list.remove("date");
                     self.head = Some(ResponseStart {
                         status,
@@ -850,10 +871,10 @@ impl Drop for Forward {
         let endpoint = self
             .endpoint
             .and_then(|id| pool.and_then(|p| p.endpoints().get(id.index())))
-            .map(|e| e.addr().clone());
+            .map(|e| e.addr());
         rt.observer.finished(&Finished {
             route: self.route,
-            pool: pool.map(|p| Box::from(p.name())).unwrap_or_default(),
+            pool: pool.map_or("", |p| p.name()),
             endpoint,
             status: self.status,
             failure: self.failure,
@@ -862,5 +883,10 @@ impl Drop for Forward {
             bytes_down: self.bytes_down,
             took: self.started.elapsed(),
         });
+        spare::give_list(core::mem::take(&mut self.parts.fields));
+        spare::give_bytes(core::mem::take(&mut self.out));
+        if let Some(head) = self.head.take() {
+            spare::give_list(head.fields);
+        }
     }
 }

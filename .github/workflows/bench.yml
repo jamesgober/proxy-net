@@ -1,0 +1,63 @@
+name: Bench
+
+# proxy-net against nginx, HAProxy, Envoy, and Pingora on one runner. Each
+# proxy is set up in its own step that may fail without failing the run; the
+# table names the ones that ran. Numbers from a shared runner are relative:
+# every target meets the same load, origin, and machine.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "benches/**"
+      - ".github/workflows/bench.yml"
+  push:
+    branches: ["feature/**", "perf/**"]
+    paths:
+      - "benches/**"
+      - ".github/workflows/bench.yml"
+
+permissions:
+  contents: read
+
+env:
+  ENVOY_IMAGE: envoyproxy/envoy:v1.31-latest
+
+jobs:
+  compare:
+    name: Compare proxies (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            benches/compare/pingora -> target
+      - name: Build the bench
+        run: cargo bench --bench compare --no-run
+      - name: nginx and HAProxy
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nginx haproxy
+          sudo systemctl stop nginx haproxy || true
+      - name: Envoy
+        continue-on-error: true
+        run: docker pull "$ENVOY_IMAGE"
+      - name: Pingora
+        continue-on-error: true
+        run: cargo build --release --manifest-path benches/compare/pingora/Cargo.toml
+      - name: Run
+        shell: bash
+        run: bash benches/compare/run.sh 10 1 16 64 | tee results.md
+      - name: Summary
+        if: always()
+        run: cat results.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-results
+          path: results.md

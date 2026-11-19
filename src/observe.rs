@@ -53,7 +53,7 @@ pub trait Observer: Send + Sync + 'static {
     }
 
     /// An exchange ended (each one exactly once).
-    fn finished(&self, exchange: &Finished) {
+    fn finished(&self, exchange: &Finished<'_>) {
         let _ = exchange;
     }
 
@@ -103,13 +103,13 @@ impl Observer for NoObserver {}
 /// What [`Observer::finished`] reports about one exchange.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Finished {
+pub struct Finished<'a> {
     /// The route that matched.
     pub route: usize,
     /// The pool's name.
-    pub pool: Box<str>,
+    pub pool: &'a str,
     /// The endpoint of the last attempt, if one was picked.
-    pub endpoint: Option<EndpointAddr>,
+    pub endpoint: Option<&'a EndpointAddr>,
     /// The status the client got, if any.
     pub status: Option<u16>,
     /// What ended it, when it failed.

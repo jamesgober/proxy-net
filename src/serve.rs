@@ -111,23 +111,62 @@ impl Proxy {
 
     /// Serves `listen` with this proxy: a serve-net server with blocking
     /// workers, the body limit raised to `Limits::max_request_body`, and the
-    /// proxy's service.
+    /// proxy's service. The same as `serve_with(listen, Inbound::new())`.
     ///
     /// # Errors
     ///
     /// `Serve` when the listener cannot be bound.
     pub fn serve<A: ToSocketAddrs>(self, listen: A) -> Result<Running, ProxyError> {
-        let limits = serve_net::Limits::default().max_body(
+        self.serve_with(listen, Inbound::new())
+    }
+
+    /// As [`serve`](Self::serve), with the client side set by `inbound`.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), proxy_net::ProxyError> {
+    /// // Behind a load balancer: every client arrives from its few addresses.
+    /// let proxy = proxy_net::ProxyBuilder::new()
+    ///     .pool("app", proxy_net::Pool::new(["10.0.0.1:80"]))
+    ///     .build()?;
+    /// let running = proxy.serve_with("0.0.0.0:8080", proxy_net::Inbound::new().max_per_source(224))?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// `Inbound` for a zero setting; `Serve` when the listener cannot be
+    /// bound or serve-net refuses a setting (a per-source cap above the
+    /// connection cap).
+    pub fn serve_with<A: ToSocketAddrs>(
+        self,
+        listen: A,
+        inbound: Inbound,
+    ) -> Result<Running, ProxyError> {
+        let mut limits = serve_net::Limits::default().max_body(
             self.shared
                 .runtime()
                 .config
                 .limits()
                 .max_request_body_value(),
         );
+        if let Some(n) = inbound.max_connections {
+            limits = limits.max_connections(n);
+        }
+        let transport = serve_net::net_io::Limits::builder()
+            .max_per_source(
+                inbound.max_per_source,
+                serve_net::net_io::PrefixPolicy::DEFAULT,
+            )
+            .build()
+            .map_err(|_| ProxyError::Inbound("max_per_source must be 1 or more"))?;
+        if inbound.workers == 0 {
+            return Err(ProxyError::Inbound("workers must be 1 or more"));
+        }
         let server = Server::builder()
             .listener(ListenerSpec::tcp("proxy", listen))
-            .workers(Workers::blocking(WORKERS))
+            .workers(Workers::blocking(inbound.workers))
             .limits(limits)
+            .transport_limits(transport)
             .serve(self.service())
             .map_err(ProxyError::Serve)?;
         // The address PROXY headers and `by=` name (serve-net does not hand
@@ -139,6 +178,89 @@ impl Proxy {
             server,
             proxy: self,
         })
+    }
+}
+
+/// How [`Proxy::serve_with`] accepts clients.
+///
+/// Each open client connection holds one blocking worker, so `workers` is
+/// the most clients served at once. `max_per_source` caps how many of those
+/// one address (an IPv6 /64) may hold, so one client cannot take every
+/// worker. Behind a load balancer or another proxy, clients arrive from a
+/// few addresses: raise it to what each of those addresses carries, or the
+/// connections above it are closed as they arrive.
+///
+/// ```
+/// let inbound = proxy_net::Inbound::new().workers(512).max_per_source(64);
+/// assert_eq!(inbound.workers_value(), 512);
+/// assert_eq!(proxy_net::Inbound::new().max_per_source_value(), 16);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Inbound {
+    workers: u16,
+    max_per_source: u32,
+    max_connections: Option<u32>,
+}
+
+impl Default for Inbound {
+    fn default() -> Inbound {
+        Inbound::new()
+    }
+}
+
+impl Inbound {
+    /// 256 workers, 16 connections per source, and serve-net's own cap on
+    /// connections (the workers less their headroom).
+    #[must_use]
+    pub const fn new() -> Inbound {
+        Inbound {
+            workers: WORKERS,
+            max_per_source: 16,
+            max_connections: None,
+        }
+    }
+
+    /// Blocking workers: the most client connections open at once.
+    #[must_use]
+    pub const fn workers(mut self, n: u16) -> Inbound {
+        self.workers = n;
+        self
+    }
+
+    /// The most connections open at once from one address (IPv4) or one
+    /// /64 (IPv6). At most the connection cap: `max_connections`, or the
+    /// workers less serve-net's headroom (224 of 256); above it the server
+    /// refuses to start (`Serve`, naming `max_per_source`).
+    #[must_use]
+    pub const fn max_per_source(mut self, n: u32) -> Inbound {
+        self.max_per_source = n;
+        self
+    }
+
+    /// The most client connections open at once, below what the workers
+    /// allow.
+    #[must_use]
+    pub const fn max_connections(mut self, n: u32) -> Inbound {
+        self.max_connections = Some(n);
+        self
+    }
+
+    /// The workers set.
+    #[must_use]
+    pub const fn workers_value(&self) -> u16 {
+        self.workers
+    }
+
+    /// The per-source cap set.
+    #[must_use]
+    pub const fn max_per_source_value(&self) -> u32 {
+        self.max_per_source
+    }
+
+    /// The connection cap set, if any.
+    #[must_use]
+    pub const fn max_connections_value(&self) -> Option<u32> {
+        self.max_connections
     }
 }
 
@@ -164,6 +286,12 @@ struct Current {
     forward: Forward,
     relaying: bool,
     buf: Vec<u8>,
+}
+
+impl Drop for Current {
+    fn drop(&mut self) {
+        crate::client::spare::give_bytes(core::mem::take(&mut self.buf));
+    }
 }
 
 thread_local! {
@@ -208,11 +336,15 @@ impl ProxyService {
             }
             _ => None,
         });
+        let mut fields = crate::client::spare::list();
+        for (n, v) in head.headers() {
+            fields.push(n, v);
+        }
         RequestParts {
             method: head.method_str().into(),
             target: target.into_boxed_str(),
             host: host_of(head).into(),
-            fields: head.headers().map(|(n, v)| (n.into(), v.into())).collect(),
+            fields,
             client,
             https: head.client().scheme() == Scheme::Https,
             body,
@@ -420,7 +552,7 @@ impl HttpService for ProxyService {
                     seq: env.seq(),
                     forward,
                     relaying: false,
-                    buf: Vec::new(),
+                    buf: crate::client::spare::bytes(),
                 });
             });
         }
@@ -458,6 +590,7 @@ impl HttpService for ProxyService {
                 for (name, value) in start.fields.iter() {
                     let _ = reply.header(name, value);
                 }
+                crate::client::spare::give_list(start.fields);
                 if !start.has_body {
                     let mut ignored = Vec::new();
                     let _ = current.forward.read_body(&mut ignored, 0);

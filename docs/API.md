@@ -15,7 +15,7 @@
 <br>
 
 > Every public item of `proxy-net`: what it does, its parameters, its errors,
-> and examples. **Version `0.5.0`, feature complete.** This file is the API
+> and examples. **Version `0.6.0`.** This file is the API
 > contract: items marked *shipped* are in this build; items marked with a
 > later version are the locked shape of what comes next, and their names and
 > signatures change only with a migration note.
@@ -37,6 +37,7 @@
   - [`ProxyHandle`, `HealthSnapshot`, `ProxyStats`](#proxyhandle-healthsnapshot-proxystats)
   - [`Observer`, `NoObserver`, `Finished`](#observer-noobserver-finished)
   - [`ProxyService`](#proxyservice)
+  - [`Inbound`](#inbound)
   - [`ProxyError`](#proxyerror)
 - [Live changes](#live-changes)
   - [`reload`, `set_endpoints`, `drain_endpoint`](#reload-set_endpoints-drain_endpoint)
@@ -114,6 +115,7 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 | 0.3.0 | the sans-IO core: balancing, health, retry accounting, head rewriting, path safety, loop detection, the exchange state machine (*shipped*) |
 | 0.4.0 | forwarding over real sockets: the serve-net service, the upstream client and connection pool, active health checks, Tier 1 (*shipped*) |
 | 0.5.0 | WebSocket bridge, TLS and the PROXY protocol to upstreams, live reload, draining, discovery, slow start, request ids (*shipped*) |
+| 0.6.0 | `wss` upstreams through the bridge, `Inbound` and `Proxy::serve_with`, buffers reused across exchanges (*shipped*) |
 
 ### Features
 
@@ -188,12 +190,15 @@ impl Proxy {
     pub fn config(&self) -> Config;                                         // the current one (0.5: owned)
     pub fn service(&self) -> ProxyService;                                  // feature `serve`
     pub fn serve<A: ToSocketAddrs>(self, listen: A) -> Result<Running, ProxyError>; // feature `serve`
+    pub fn serve_with<A: ToSocketAddrs>(self, listen: A, inbound: Inbound)
+        -> Result<Running, ProxyError>;                                     // 0.6, feature `serve`
     pub fn forward(&self, route: usize, parts: RequestParts) -> Option<Forward>;
     pub fn hash(&self, pool: usize, bytes: &[u8]) -> Option<u64>;
 }
 ```
 
-- `serve` starts a serve-net server on `listen` with 256 blocking workers and the body limit raised to `Limits::max_request_body`, and mounts the proxy's service.
+- `serve` starts a serve-net server on `listen` with 256 blocking workers and the body limit raised to `Limits::max_request_body`, and mounts the proxy's service. It is `serve_with(listen, Inbound::new())`.
+- `serve_with` (0.6) sets the client side with an [`Inbound`](#inbound): workers, the per-source connection cap, and a connection cap.
 - `service` gives the serve-net `HttpService` to mount in a server of your own. Give that server blocking workers (`Workers::blocking`) and a body limit at least `Limits::max_request_body`: until serve-net can park a streamed reply, the proxy waits on the upstream inside the service.
 - `forward` starts one exchange for another inbound engine; see [`Forward`](#forward-requestparts-responsestart-failure).
 - Dropping the `Proxy` stops the checker and closes the idle connections.
@@ -260,7 +265,7 @@ for pool in running.handle().health().pools {
 
 `response_outlier` reports, never blocks. Each route keeps a moving mean of its response sizes (weight 1/32); once a route has 100 responses, one over 8 times the mean and over 64 KiB is reported. It costs three relaxed atomic operations per exchange.
 
-`Finished` carries the route, pool, endpoint, status, failure class, attempts, bytes up and down, and the time it took.
+`Finished` carries the route, pool, endpoint, status, failure class, attempts, bytes up and down, and the time it took. From 0.6 it borrows: `Finished<'a>` with `pool: &'a str` and `endpoint: Option<&'a EndpointAddr>`, so reporting an exchange copies nothing; an observer that keeps them copies what it keeps.
 
 ```rust
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -288,9 +293,34 @@ let builder = proxy_net::ProxyBuilder::new().observer(Retries::default());
 - 0.5: a request whose head arrived before a live change is routed again under the new configuration when its body is forwarded, with the route, loop, and request checks run again, so one request is never judged by two configurations.
 - 0.5, feature `ws`: a WebSocket upgrade on a route with `websocket(true)` goes to [the bridge](#the-websocket-bridge); on any other route an upgrade is refused.
 
+### `Inbound`
+
+*Shipped (0.6, feature `serve`).* How `Proxy::serve_with` accepts clients.
+
+```rust,ignore
+impl Inbound {
+    pub const fn new() -> Inbound;                         // 256 workers, 16 per source, serve-net's own cap
+    pub const fn workers(self, n: u16) -> Inbound;          // blocking workers: the most clients at once
+    pub const fn max_per_source(self, n: u32) -> Inbound;   // per IPv4 address or IPv6 /64
+    pub const fn max_connections(self, n: u32) -> Inbound;  // below what the workers allow
+    pub const fn workers_value(&self) -> u16;
+    pub const fn max_per_source_value(&self) -> u32;
+    pub const fn max_connections_value(&self) -> Option<u32>;
+}
+```
+
+- Each open client connection holds one worker. The per-source cap keeps one address from holding every worker; connections above it are closed as they arrive.
+- Behind a load balancer or another proxy every client arrives from a few addresses: raise `max_per_source` to what each of them carries. It can be at most the connection cap (`max_connections`, or the workers less serve-net's headroom: 224 of 256); above it the server refuses to start.
+- A zero setting is refused with `ProxyError::Inbound`.
+
+```rust
+let inbound = proxy_net::Inbound::new().workers(512).max_per_source(128);
+assert_eq!(inbound.max_per_source_value(), 128);
+```
+
 ### `ProxyError`
 
-*Shipped (0.4).* `Config(ConfigError)`, `Serve(serve_net::ServeError)` (feature `serve`), `Io(std::io::Error)`.
+*Shipped (0.4).* `Config(ConfigError)`, `Serve(serve_net::ServeError)` (feature `serve`), `Io(std::io::Error)`, and from 0.6 `Inbound(&'static str)` (feature `serve`), naming the refused setting.
 
 ---
 
@@ -416,7 +446,8 @@ let pool = Pool::new(["api.internal:443"]).tls(UpstreamTls::new().server_name("a
 - The client gets its 101 only after the upstream's genuine 101 with the accept key for the key the proxy sent (T-11). Anything else answers 502 and no tunnel opens.
 - The upstream request's fields are rewritten as for any request (forwarding headers, rules, `Host`), and the PROXY header is sent when the pool has one.
 - The subprotocol the upstream chose goes to the client. serve-net keeps these names for the life of the process, so the bridge accepts at most 64 distinct names; past that an upgrade answers 502.
-- A pool with `tls` is not bridged in 0.5 (502): the bridge reads and writes the upstream from two threads, and a TLS stream cannot be split.
+- 0.6: a pool with `tls` is bridged (`wss`). The certificate is verified as for any TLS pool before the upgrade is sent; a handshake that fails answers 502 and no upgrade reaches the upstream. The bridge's two threads share the TLS session under one lock, so records leave in the order they were sealed.
+- permessage-deflate is not negotiated with either side (0.6 decision): see `docs/PERFORMANCE.md` for what it would cost.
 - serve-net cannot yet close a client's WebSocket from outside a callback, so an upstream close reaches the client at its next message, or when the tunnel idle timeout ends the connection.
 
 ---
@@ -491,7 +522,7 @@ assert_eq!(body, b"ok");
 
 ```rust,ignore
 pub struct RequestParts { pub method: Box<str>, pub target: Box<str>, pub host: Box<[u8]>,
-                          pub fields: Vec<(Box<str>, Box<[u8]>)>, pub client: Option<SocketAddr>,
+                          pub fields: FieldList, pub client: Option<SocketAddr>,         // 0.6: a FieldList
                           pub https: bool, pub body: BodyFacts, pub key: Option<u64>,
                           pub peer: Option<SocketAddr>, pub hops: u8,          // 0.5, append mode
                           pub request_id: Option<Box<[u8]>> }                  // 0.5

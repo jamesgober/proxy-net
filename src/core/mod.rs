@@ -7,6 +7,7 @@
 //! and [`Exchange`], the forwarding state machine. The upstream client and
 //! the serve-net service that drive it arrive in `0.4.0`.
 
+mod adaptive;
 mod atomic;
 mod balance;
 mod budget;
@@ -25,10 +26,14 @@ pub use budget::{RetryBudget, is_idempotent};
 pub use class::{ErrorClass, LimitKind, Outcome, RefusalKind, TimeoutKind};
 pub use exchange::{Action, Event, Exchange};
 pub use fields::FieldList;
+#[cfg(feature = "client")]
+pub(crate) use fields::FieldSource;
 pub use forward::{
     BodyFacts, FRAME_FIELD, ForwardFacts, detect_loop, request_fields, response_fields,
     rewrite_target,
 };
+#[cfg(feature = "client")]
+pub(crate) use forward::{request_fields_in, response_fields_in};
 pub use health::{EndpointId, EndpointState, HealthTable, Transition};
 pub use path::{check_path, check_request};
 pub use route::{CompiledRoute, PathRewrite, RouteMatch, RouteTable};

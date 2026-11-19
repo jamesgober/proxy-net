@@ -28,6 +28,9 @@ pub enum ProxyError {
     Serve(serve_net::ServeError),
     /// The health checker thread could not be started.
     Io(std::io::Error),
+    /// An [`Inbound`](crate::Inbound) setting was refused; the text names it.
+    #[cfg(feature = "serve")]
+    Inbound(&'static str),
 }
 
 impl std::fmt::Display for ProxyError {
@@ -37,6 +40,8 @@ impl std::fmt::Display for ProxyError {
             #[cfg(feature = "serve")]
             ProxyError::Serve(e) => write!(f, "server: {e}"),
             ProxyError::Io(e) => write!(f, "health checker: {e}"),
+            #[cfg(feature = "serve")]
+            ProxyError::Inbound(what) => write!(f, "inbound: {what}"),
         }
     }
 }

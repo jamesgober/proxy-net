@@ -1,0 +1,4 @@
+# One worker thread per CPU of the runner, like the other proxies.
+---
+version: 1
+threads: 4

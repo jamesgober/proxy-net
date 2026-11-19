@@ -3,12 +3,16 @@
 //! parsed on one side and written again on the other. No frame passes
 //! through as raw bytes, and a tunnel opens only after the upstream's
 //! genuine 101 with the accept key for the key the proxy sent (T-11).
+//!
+//! Toward a pool with TLS (`wss`), the session sits under the same lock as
+//! the upstream WebSocket state, and the reading thread hands it ciphertext
+//! from its own clone of the socket; see `client::split`.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use serve_net::{ConnectionId, Envelope, WebSocketConn, WebSocketService, WsMessage, WsSender};
@@ -53,20 +57,68 @@ fn intern(name: &str) -> Option<&'static str> {
     Some(leaked)
 }
 
+/// The write side of the upstream socket, with TLS on it for a pool that
+/// has TLS.
+enum Wire {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(TcpStream, Box<crate::client::split::TlsHalf>),
+}
+
+impl Wire {
+    /// The plaintext in bytes read from the socket, and whether the peer
+    /// ended TLS.
+    fn absorb<'a>(&'a mut self, read: &'a [u8]) -> std::io::Result<(&'a [u8], bool)> {
+        match self {
+            Wire::Plain(_) => Ok((read, false)),
+            #[cfg(feature = "tls")]
+            Wire::Tls(w, half) => half.absorb(read, &mut &*w),
+        }
+    }
+
+    /// Sends from `bytes`: how many went, or 0 when TLS must read more first.
+    fn send(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Wire::Plain(w) => w.write_all(bytes).map(|()| bytes.len()),
+            #[cfg(feature = "tls")]
+            Wire::Tls(w, half) => half.send(bytes, &mut &*w),
+        }
+    }
+
+    /// Ends the connection (`close_notify` first with TLS).
+    fn shutdown(&mut self) {
+        match self {
+            Wire::Plain(w) => {
+                let _ = w.shutdown(std::net::Shutdown::Both);
+            }
+            #[cfg(feature = "tls")]
+            Wire::Tls(w, half) => {
+                half.close(&mut &*w);
+                let _ = w.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
 /// An upstream WebSocket that passed its handshake, waiting for serve-net's
 /// 101 to the client.
 struct Pending {
     read: TcpStream,
-    write: TcpStream,
+    wire: Wire,
     conn: Connection,
     idle: Duration,
+    write_idle: Duration,
     since: Instant,
 }
 
 /// A bridged connection in both directions.
 struct Live {
-    /// The upstream connection's state and its write half.
-    out: Mutex<(Connection, TcpStream)>,
+    /// The upstream connection's state and the socket's write side.
+    out: Mutex<(Connection, Wire)>,
+    /// Signalled after each read from the upstream, for a send that TLS held
+    /// until more input arrived.
+    fed: Condvar,
+    write_idle: Duration,
     closed: AtomicBool,
     code: AtomicU32,
 }
@@ -109,6 +161,44 @@ fn dial(addr: &EndpointAddr, deadline: Instant) -> Result<TcpStream, ErrorClass>
     Err(ErrorClass::Connect)
 }
 
+/// Reads once from the upstream within `deadline` and appends the
+/// plaintext to `into`.
+fn read_more(
+    read: &TcpStream,
+    wire: &mut Wire,
+    into: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<(), ErrorClass> {
+    let timeout = ErrorClass::Timeout(crate::core::TimeoutKind::ResponseHead);
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(timeout);
+    }
+    read.set_read_timeout(Some(left))
+        .map_err(|_| ErrorClass::UpstreamReset)?;
+    let mut chunk = [0u8; 2048];
+    let mut reader = read;
+    let n = match reader.read(&mut chunk) {
+        Ok(0) => return Err(ErrorClass::UpstreamReset),
+        Ok(n) => n,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err(timeout);
+        }
+        Err(_) => return Err(ErrorClass::UpstreamReset),
+    };
+    let (plain, closed) = wire.absorb(&chunk[..n]).map_err(|_| ErrorClass::Tls)?;
+    if closed && plain.is_empty() {
+        return Err(ErrorClass::UpstreamReset);
+    }
+    into.extend_from_slice(plain);
+    Ok(())
+}
+
 /// What `open` needs from the client's request.
 pub(crate) struct Upgrade<'a> {
     pub fields: Vec<(&'a str, &'a [u8])>,
@@ -140,9 +230,11 @@ pub(crate) fn open(
     ) else {
         return Err(ErrorClass::NoEndpoint);
     };
+    #[cfg(feature = "tls")]
+    let tls = prt.tls.clone();
+    #[cfg(not(feature = "tls"))]
     if cfg.tls().is_some() {
-        // A TLS stream cannot be read and written from two threads; see the
-        // roadmap.
+        // Refused when the configuration was built; never in the clear.
         return Err(ErrorClass::Tls);
     }
     let id = prt.balancer.pick(None, &[]).ok_or(ErrorClass::NoEndpoint)?;
@@ -154,10 +246,25 @@ pub(crate) fn open(
     let result = (|| {
         let deadline = Instant::now() + timeouts.connect_value();
         let mut stream = dial(endpoint.addr(), deadline)?;
+        stream
+            .set_write_timeout(Some(timeouts.write_idle_value()))
+            .map_err(|_| ErrorClass::Connect)?;
         let pre = prelude(cfg.proxy_protocol(), up.client, rt.listener, up.host);
         if !pre.is_empty() {
             stream.write_all(&pre).map_err(|_| ErrorClass::Connect)?;
         }
+        let write = stream.try_clone().map_err(|_| ErrorClass::UpstreamReset)?;
+        #[cfg(feature = "tls")]
+        let mut wire = match &tls {
+            Some(t) => {
+                let session = t.session(endpoint.addr())?;
+                let half = crate::client::split::TlsHalf::handshake(session, &stream, deadline)?;
+                Wire::Tls(write, Box::new(half))
+            }
+            None => Wire::Plain(write),
+        };
+        #[cfg(not(feature = "tls"))]
+        let mut wire = Wire::Plain(write);
         // The upstream request's fields, rewritten as for any request.
         let facts = ForwardFacts::new(up.method, up.target, up.host, endpoint)
             .client(up.client)
@@ -203,37 +310,18 @@ pub(crate) fn open(
         hs.write_request(&host, &target, &mut out)
             .map_err(|_| ErrorClass::UpstreamProtocol)?;
         let head_deadline = Instant::now() + timeouts.response_head_value();
-        stream
-            .set_write_timeout(Some(timeouts.write_idle_value()))
-            .map_err(|_| ErrorClass::Connect)?;
-        stream
-            .write_all(&out)
-            .map_err(|_| ErrorClass::UpstreamReset)?;
+        // The plaintext received so far: the 101, then any frames after it.
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
-        let mut reader = HeadReader::new();
-        let mut chunk = [0u8; 2048];
-        let (protocol, conn, leftover) = loop {
-            let left = head_deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(ErrorClass::Timeout(crate::core::TimeoutKind::ResponseHead));
-            }
-            stream
-                .set_read_timeout(Some(left))
-                .map_err(|_| ErrorClass::UpstreamReset)?;
-            let n = match stream.read(&mut chunk) {
-                Ok(0) => return Err(ErrorClass::UpstreamReset),
-                Ok(n) => n,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Err(ErrorClass::Timeout(crate::core::TimeoutKind::ResponseHead));
-                }
+        let mut at = 0;
+        while at < out.len() {
+            match wire.send(&out[at..]) {
+                Ok(0) => read_more(&stream, &mut wire, &mut buf, head_deadline)?,
+                Ok(n) => at += n,
                 Err(_) => return Err(ErrorClass::UpstreamReset),
-            };
-            buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+        let mut reader = HeadReader::new();
+        let (protocol, conn, leftover) = loop {
             if buf.len() > 16 * 1024 {
                 return Err(ErrorClass::UpstreamProtocol);
             }
@@ -248,20 +336,20 @@ pub(crate) fn open(
                     let conn = hs.connection(&verified);
                     break (protocol, conn, buf[len..].to_vec());
                 }
-                Ok(None) => {}
+                Ok(None) => read_more(&stream, &mut wire, &mut buf, head_deadline)?,
                 Err(_) => return Err(ErrorClass::UpstreamProtocol),
             }
         };
         let mut conn = conn;
         let _ = conn.feed(&leftover);
-        let write = stream.try_clone().map_err(|_| ErrorClass::UpstreamReset)?;
         let _ = bridges.lock_pending().insert(
             connection,
             Pending {
                 read: stream,
-                write,
+                wire,
                 conn,
                 idle: timeouts.tunnel_idle_value(),
+                write_idle: timeouts.write_idle_value(),
                 since: Instant::now(),
             },
         );
@@ -287,17 +375,26 @@ pub(crate) struct BridgeService {
     pub bridges: Arc<Bridges>,
 }
 
-fn flush(conn: &mut Connection, write: &mut TcpStream) -> bool {
+/// How a flush of the upstream WebSocket's output ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flushed {
+    Done,
+    /// TLS cannot seal until more input arrives; the rest stays queued.
+    Held,
+    Failed,
+}
+
+fn flush(conn: &mut Connection, wire: &mut Wire) -> Flushed {
     loop {
         let out = conn.output();
         if out.is_empty() {
-            return true;
+            return Flushed::Done;
         }
-        let n = out.len();
-        if write.write_all(out).is_err() {
-            return false;
+        match wire.send(out) {
+            Ok(0) => return Flushed::Held,
+            Ok(n) => conn.advance_output(n),
+            Err(_) => return Flushed::Failed,
         }
-        conn.advance_output(n);
     }
 }
 
@@ -315,10 +412,18 @@ fn pump(mut read: TcpStream, live: Arc<Live>, sender: WsSender, idle: Duration) 
         let mut ended = false;
         {
             let mut guard = live.out.lock().unwrap_or_else(PoisonError::into_inner);
-            let (conn, write) = &mut *guard;
+            let (conn, wire) = &mut *guard;
+            let (plain, tls_closed) = match wire.absorb(&buf[..n]) {
+                Ok(found) => found,
+                Err(_) => {
+                    live.code.store(1011, Ordering::Release);
+                    (&[][..], true)
+                }
+            };
+            ended |= tls_closed;
             let mut at = 0;
-            while at < n {
-                at += conn.feed(&buf[at..n]).max(1);
+            while at < plain.len() {
+                at += conn.feed(&plain[at..]).max(1);
                 loop {
                     match conn.poll() {
                         Ok(Event::Text(t)) => messages.push((true, t.as_bytes().to_vec())),
@@ -342,8 +447,10 @@ fn pump(mut read: TcpStream, live: Arc<Live>, sender: WsSender, idle: Duration) 
                     break;
                 }
             }
-            let _ = flush(conn, write);
+            // Held output goes with the next flush, after more input.
+            let _ = flush(conn, wire);
         }
+        live.fed.notify_all();
         for (text, bytes) in messages {
             let sent = if text {
                 sender.send_text(&String::from_utf8_lossy(&bytes))
@@ -360,6 +467,7 @@ fn pump(mut read: TcpStream, live: Arc<Live>, sender: WsSender, idle: Duration) 
         }
     }
     live.closed.store(true, Ordering::Release);
+    live.fed.notify_all();
 }
 
 impl WebSocketService for BridgeService {
@@ -369,7 +477,9 @@ impl WebSocketService for BridgeService {
             return;
         };
         let live = Arc::new(Live {
-            out: Mutex::new((p.conn, p.write)),
+            out: Mutex::new((p.conn, p.wire)),
+            fed: Condvar::new(),
+            write_idle: p.write_idle,
             closed: AtomicBool::new(false),
             code: AtomicU32::new(1001),
         });
@@ -400,13 +510,34 @@ impl WebSocketService for BridgeService {
             return;
         }
         let mut guard = live.out.lock().unwrap_or_else(PoisonError::into_inner);
-        let (up, write) = &mut *guard;
         let sent = match message {
-            WsMessage::Text(t) => up.send_text(t).is_ok(),
-            WsMessage::Binary(b) => up.send_binary(b).is_ok(),
+            WsMessage::Text(t) => guard.0.send_text(t).is_ok(),
+            WsMessage::Binary(b) => guard.0.send_binary(b).is_ok(),
             _ => true,
         };
-        if !sent || !flush(up, write) {
+        let mut flushed = if sent {
+            let (up, wire) = &mut *guard;
+            flush(up, wire)
+        } else {
+            Flushed::Failed
+        };
+        // TLS held the send for the rest of a message from the upstream:
+        // wait for the reading thread, within the write timeout.
+        let deadline = Instant::now() + live.write_idle;
+        while flushed == Flushed::Held && !live.closed.load(Ordering::Acquire) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            guard = live
+                .fed
+                .wait_timeout(guard, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+            let (up, wire) = &mut *guard;
+            flushed = flush(up, wire);
+        }
+        if flushed != Flushed::Done {
             live.closed.store(true, Ordering::Release);
             drop(guard);
             let _ = conn.close(1011, "upstream failed");
@@ -418,14 +549,14 @@ impl WebSocketService for BridgeService {
             return;
         };
         let mut guard = live.out.lock().unwrap_or_else(PoisonError::into_inner);
-        let (up, write) = &mut *guard;
+        let (up, wire) = &mut *guard;
         let close = code
             .map(ws_net::CloseCode::new)
             .filter(ws_net::CloseCode::is_sendable)
             .unwrap_or(ws_net::CloseCode::NORMAL);
         let _ = up.close(close, "");
-        let _ = flush(up, write);
-        let _ = write.shutdown(std::net::Shutdown::Both);
+        let _ = flush(up, wire);
+        wire.shutdown();
         live.closed.store(true, Ordering::Release);
     }
 }

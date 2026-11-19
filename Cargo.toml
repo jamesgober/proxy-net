@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "proxy-net"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -29,7 +29,7 @@ repository    = "https://github.com/jamesgober/proxy-net"
 documentation = "https://docs.rs/proxy-net"
 
 # Not shipped in the package
-exclude = ["fuzz/", "dev/", ".github/"]
+exclude = ["fuzz/", "dev/", ".github/", "benches/compare/"]
 
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
@@ -41,6 +41,17 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lib]
 name = "proxy_net"
 path = "src/lib.rs"
+
+# Load tests for docs/PERFORMANCE.md (std only; see the file's header).
+[[bench]]
+name = "compare"
+harness = false
+required-features = ["serve"]
+
+# Hot paths of the sans-IO core.
+[[bench]]
+name = "core"
+harness = false
 
 
 # FEATURE FLAGS

@@ -142,6 +142,9 @@ fn run(shared: &Shared, stop: &Stop) {
 /// Asks the refreshing discovery sources whose time has come, and reloads a
 /// pool whose endpoints changed.
 fn refresh_discovery(shared: &Shared, refresh: &mut Vec<(Box<str>, Instant)>) {
+    if !shared.discovers() {
+        return;
+    }
     let builder = shared.builder();
     let now = Instant::now();
     let mut changed: Vec<(Box<str>, Vec<crate::Endpoint>)> = Vec::new();
