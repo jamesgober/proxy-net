@@ -86,7 +86,7 @@ impl ProxyBuilder {
     }
 
     /// Adds a field to the set removed from every request before the proxy
-    /// writes its own forwarding fields (FR-50).
+    /// writes its own forwarding fields.
     ///
     /// ```
     /// let b = proxy_net::ProxyBuilder::new().strip_header("CF-Connecting-IP");
@@ -308,8 +308,8 @@ impl UnknownHost {
     }
 }
 
-/// Size and count limits of the proxy (section 7.9 of the design gives the
-/// memory they bound).
+/// Size and count limits of the proxy. In-flight memory is bounded by
+/// `max_exchanges x (request_buffer + relay_buffer)` plus head buffers.
 ///
 /// ```
 /// let limits = proxy_net::Limits::default()
@@ -357,7 +357,8 @@ impl Limits {
         self
     }
 
-    /// Request body bytes held before an upstream connection is taken (FR-34),
+    /// Request body bytes held before an upstream connection is taken (so a
+    /// slow client does not hold an upstream connection for a small body),
     /// and the most a retry can replay. 1 KiB to 16 MiB. Default 64 KiB.
     pub fn request_buffer(mut self, bytes: u32) -> Limits {
         self.request_buffer = bytes;
@@ -449,7 +450,7 @@ impl Limits {
     }
 }
 
-/// Which forwarding fields the proxy writes (FR-51). Whatever the style,
+/// Which forwarding fields the proxy writes. Whatever the style,
 /// every field of the forwarding set a client sent is removed first.
 ///
 /// ```
@@ -511,7 +512,7 @@ impl Forwarded {
     }
 
     /// Keep the elements added by trusted proxies in front of this one and
-    /// append this hop (FR-52, from 0.5).
+    /// append this hop (from 0.5).
     pub fn append_trusted(mut self) -> Forwarded {
         self.append_trusted = true;
         self

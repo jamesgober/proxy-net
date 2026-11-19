@@ -346,7 +346,7 @@ impl HashKey {
     }
 }
 
-/// An active health check (FR-17): a request or a connect sent to every
+/// An active health check: a request or a connect sent to every
 /// endpoint on a schedule.
 ///
 /// ```
@@ -550,8 +550,8 @@ impl HealthCheck {
 }
 
 /// Passive health: endpoints that keep failing real requests are taken out
-/// for a while (FR-16), and a pool that has lost most of its endpoints sends
-/// to all of them rather than to none (FR-18).
+/// for a while, and a pool that has lost most of its endpoints sends to all
+/// of them rather than to none.
 ///
 /// ```
 /// use std::time::Duration;
@@ -660,7 +660,7 @@ impl Outlier {
     }
 }
 
-/// Retries of failed requests (FR-38, FR-39). Only idempotent methods are
+/// Retries of failed requests. Only idempotent methods are
 /// retried, only when the request body is held in full, and only before any
 /// byte of a response reached the client.
 ///
@@ -764,7 +764,7 @@ impl Retry {
     }
 }
 
-/// Timeouts toward a pool's endpoints (FR-37).
+/// Timeouts toward a pool's endpoints.
 ///
 /// ```
 /// use std::time::Duration;
@@ -888,7 +888,7 @@ impl Timeouts {
     }
 }
 
-/// Connection limits toward a pool's endpoints (FR-20, FR-35, FR-36).
+/// Connection limits toward a pool's endpoints.
 ///
 /// ```
 /// use std::time::Duration;

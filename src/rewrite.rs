@@ -26,7 +26,7 @@ pub(crate) const RESERVED: &[&str] = &[
 ];
 
 /// The fields removed from every request before the proxy writes its own
-/// forwarding fields (FR-50). [`ProxyBuilder::strip_header`](crate::ProxyBuilder::strip_header)
+/// forwarding fields. [`ProxyBuilder::strip_header`](crate::ProxyBuilder::strip_header)
 /// adds to this set.
 pub const FORWARDING_SET: &[&str] = &[
     "forwarded",
@@ -202,7 +202,7 @@ pub enum PathCheck {
     Semicolon,
 }
 
-/// Which ambiguous request paths a route refuses with 400 (FR-5). The default,
+/// Which ambiguous request paths a route refuses with 400. The default,
 /// [`PathPolicy::STRICT`], refuses all of them.
 ///
 /// ```
