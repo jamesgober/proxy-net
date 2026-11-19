@@ -51,6 +51,7 @@ jobs:
         continue-on-error: true
         run: cargo build --release --manifest-path benches/compare/pingora/Cargo.toml
       - name: Run
+        shell: bash
         run: bash benches/compare/run.sh 10 1 16 64 | tee results.md
       - name: Summary
         if: always()

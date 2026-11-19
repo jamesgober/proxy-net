@@ -11,9 +11,9 @@ shift || true
 COUNTS=("${@:-1 16 64}")
 read -r -a COUNTS <<< "${COUNTS[*]}"
 
-cargo bench --bench compare --no-run --quiet 2>/dev/null
-BIN=$(find target/release/deps -maxdepth 1 -type f -name 'compare-*' ! -name '*.d' | head -1)
-[ -x "$BIN" ] || { echo "the bench binary was not built"; exit 2; }
+BIN=$(cargo bench --bench compare --no-run --message-format=json 2>/dev/null \
+  | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -1)
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "the bench binary was not built"; exit 2; }
 
 PIDS=()
 cleanup() {
