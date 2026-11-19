@@ -7,19 +7,14 @@
 //!
 //! ## Status
 //!
-//! `0.4.0` forwards real traffic. [`proxy`] puts a listener in front of a set
-//! of servers in one line; [`ProxyBuilder`] builds pools, routes, and health
-//! checks, and [`ProxyBuilder::build`] starts a [`Proxy`]. The decisions live
-//! in [`core`] (sans-IO); [`client`] drives them against real connections; the
-//! serve-net service is [`ProxyService`]. The full API, with the version each
-//! part ships in, is in `docs/API.md` in the
+//! `0.4.0` forwards real traffic. With the default features, `proxy_net::proxy`
+//! puts a listener in front of a set of servers in one line, and
+//! `ProxyBuilder::build` starts a `Proxy` from pools, routes, and health
+//! checks. The decisions live in [`core`] (sans-IO, no `std` needed); the
+//! `client` module (feature `client`) drives them against real connections,
+//! and `ProxyService` (feature `serve`) is the serve-net service. The full API,
+//! with the version each part ships in, is in `docs/API.md` in the
 //! [repository](https://github.com/jamesgober/proxy-net).
-//!
-//! ```no_run
-//! let running = proxy_net::proxy("127.0.0.1:8080", ["127.0.0.1:3000", "127.0.0.1:3001"])?;
-//! running.wait();
-//! # Ok::<(), proxy_net::ProxyError>(())
-//! ```
 //!
 //! ## Example
 //!
@@ -109,11 +104,11 @@ pub use serve::{ProxyService, Running, proxy};
 
 // The README's and the API reference's examples run as doctests, so their
 // claims are checked against the build.
-#[cfg(all(doctest, feature = "std"))]
+#[cfg(all(doctest, feature = "serve"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-#[cfg(all(doctest, feature = "std"))]
+#[cfg(all(doctest, feature = "serve"))]
 #[doc = include_str!("../docs/API.md")]
 struct ApiDoctests;
 

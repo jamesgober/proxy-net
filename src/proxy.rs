@@ -79,9 +79,9 @@ impl ProxyBuilder {
 /// let proxy = proxy_net::ProxyBuilder::new()
 ///     .pool("app", proxy_net::Pool::new(["127.0.0.1:3000", "127.0.0.1:3001"]))
 ///     .build()?;
-/// let running = proxy.serve("127.0.0.1:8080")?;
-/// running.wait();
-/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// // With the `serve` feature: `let running = proxy.serve("127.0.0.1:8080")?;`
+/// assert_eq!(proxy.handle().health().pools[0].endpoints.len(), 2);
+/// # Ok::<(), proxy_net::ProxyError>(())
 /// ```
 pub struct Proxy {
     pub(crate) rt: Arc<Runtime>,
