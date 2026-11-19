@@ -316,7 +316,7 @@ fn client(
                 match status {
                     200 if !expect_refusal => t.ok.fetch_add(1, Ordering::Relaxed),
                     400 if expect_refusal => t.refused_as_expected.fetch_add(1, Ordering::Relaxed),
-                    502 | 503 | 504 => t.upstream_errors.fetch_add(1, Ordering::Relaxed),
+                    502..=504 => t.upstream_errors.fetch_add(1, Ordering::Relaxed),
                     _ => t.unexpected.fetch_add(1, Ordering::Relaxed),
                 };
                 mine.push(u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX));
@@ -397,7 +397,7 @@ fn main() {
             std::thread::spawn(move || {
                 client(
                     addr,
-                    0x9e37_79b9 ^ (i as u64 + 1) * 7919,
+                    0x9e37_79b9 ^ ((i as u64 + 1) * 7919),
                     stop,
                     tally,
                     lat,
