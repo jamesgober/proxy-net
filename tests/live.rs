@@ -6,7 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -161,16 +161,20 @@ fn test_set_endpoints_and_drain() {
     assert!(h.set_endpoints("nope", &[]).is_err());
 }
 
+/// A source that gives `first` until `moved` is set, then `then`.
 struct Changing {
-    calls: AtomicUsize,
+    moved: Arc<AtomicBool>,
     first: SocketAddr,
     then: SocketAddr,
 }
 
 impl Discovery for Changing {
     fn endpoints(&self) -> Result<Vec<Endpoint>, DiscoveryError> {
-        let n = self.calls.fetch_add(1, Ordering::Relaxed);
-        let addr = if n == 0 { self.first } else { self.then };
+        let addr = if self.moved.load(Ordering::Acquire) {
+            self.then
+        } else {
+            self.first
+        };
         Ok(vec![Endpoint::new(EndpointAddr::Ip(addr))])
     }
 
@@ -181,6 +185,7 @@ impl Discovery for Changing {
 
 #[test]
 fn test_discovery_refreshes_the_pool() {
+    let moved = Arc::new(AtomicBool::new(false));
     let (a, _) = upstream("a");
     let (b, _) = upstream("b");
     let (_p, addr) = serve(
@@ -188,14 +193,19 @@ fn test_discovery_refreshes_the_pool() {
             "app",
             Pool::new(Vec::<&str>::new())
                 .discovery(Changing {
-                    calls: AtomicUsize::new(0),
+                    moved: Arc::clone(&moved),
                     first: a,
                     then: b,
                 })
                 .discovery_allow(&["127.0.0.0/8"]),
         ),
     );
-    assert_eq!(get(addr), "a");
+    // Several refreshes pass with the same answer and change nothing.
+    for _ in 0..3 {
+        assert_eq!(get(addr), "a");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    moved.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(5);
     while get(addr) != "b" {
         assert!(Instant::now() < deadline, "discovery never moved the pool");
