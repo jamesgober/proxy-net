@@ -34,6 +34,17 @@ fn test_the_upstream_bytes_read_the_same_to_two_parsers() {
 }
 
 #[test]
+fn test_fuzz_findings() {
+    // A field of the input's own making named `expect` with an empty value:
+    // only `Expect: 100-continue` is the inbound side's to answer, so this
+    // one goes upstream (the oracle once counted every `Expect` as removed).
+    let expect_empty = [
+        0x88, 0x04, 0x00, 0x02, 0x6c, 0x65, 0x50, 0x63, 0x35, 0x04, 0x02, 0x85,
+    ];
+    assert_eq!(differential::check(&expect_empty), Ok(true));
+}
+
+#[test]
 fn test_the_reference_reader_refuses_what_it_should() {
     use differential::reference;
     assert!(reference(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").is_ok());

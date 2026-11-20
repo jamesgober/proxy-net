@@ -60,8 +60,8 @@
 - Moved, with the reason in PLAN D-065: the reactor path. serve-net G-1 and net-io G-11 are still open (serve-net 0.8.2 and net-io 0.8.1 are the newest on 2026-11-19); it comes in the first version after both close. This is a hard external dependency, not a deferral by choice.
 
 ## v0.7.0 - Hardening (2026-11-20)
-- [ ] 24-hour fuzz campaign per target (nine targets, `differential` included).
-- [ ] 24-hour soak on Linux and on Windows on serve-net 0.8.3 (`benches/soak.rs`, D-071, D-072).
+- [ ] 24-hour fuzz campaign per target (nine targets, `differential` included). Seven ran 24 hours with no findings. `forwarded_append` found a real bug after 2.5 hours (a client's `Host` could add a `Forwarded` element; fixed, D-073) and `differential` a fault in its oracle after 8 hours (fixed, D-074); both run 24 hours again on the fix, from 2026-11-20 19:35 UTC, and this box is checked when they end clean.
+- [x] 24-hour soak on Linux and on Windows on serve-net 0.8.3 (`benches/soak.rs`, D-071, D-072): both passed at e27f228 (590 and 524 million requests, live heap growth 4.4% and 6.2% over the second half).
 - [x] The full attack suite: every threat T-1 to T-22 has a named test (`tests/attacks_suite.rs` adds T-8, T-9, T-12, T-16, T-18, T-19, T-21, T-22; D-069).
 - [x] The multi-node test (`tests/multi_node.rs`: a chain, a loop, failover).
 - [x] Idea I-6 (`tests/differential.rs`, the `differential` fuzz target; D-070).

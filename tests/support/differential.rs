@@ -335,10 +335,11 @@ const FIELDS: [(&str, &str); 24] = [
     ("X-Empty", ""),
     ("x-MiXeD", "v\tw"),
 ];
-/// Fields that never reach the upstream: hop-by-hop ones, the proxy's own
-/// frame field, and `Expect: 100-continue` (answered by the inbound side).
-/// `X-A` is added when a `Connection` field names it.
-const HOP: [&str; 8] = [
+/// Fields that never reach the upstream: hop-by-hop ones and the proxy's own
+/// frame field. `X-A` is added when a `Connection` field names it, and
+/// `Expect` when its value is `100-continue` (answered by the inbound side);
+/// other expectations are end to end and go through.
+const HOP: [&str; 7] = [
     "connection",
     "keep-alive",
     "proxy-connection",
@@ -346,7 +347,6 @@ const HOP: [&str; 8] = [
     "trailer",
     "upgrade",
     "proxy-frame",
-    "expect",
 ];
 
 /// One request from `data`: forwarded, captured, parsed twice, compared.
@@ -442,6 +442,13 @@ pub fn check(data: &[u8]) -> Result<bool, String> {
         if count(h) != 0 {
             return Err(format!("{h} was forwarded"));
         }
+    }
+    if ours
+        .fields
+        .iter()
+        .any(|(n, v)| n == "expect" && v.eq_ignore_ascii_case(b"100-continue"))
+    {
+        return Err("Expect: 100-continue was forwarded".into());
     }
     if names_x_a && count("x-a") != 0 {
         return Err("x-a was forwarded though Connection named it".into());

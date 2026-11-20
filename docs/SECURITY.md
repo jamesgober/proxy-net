@@ -63,7 +63,7 @@ Costs are per request unless stated; measured values are from `docs/PERFORMANCE.
 |---|---|---|---|---|
 | T-1 | Request smuggling between the proxy and an upstream | requests are parsed strictly (http-net) and written again with framing the proxy chose: client `Content-Length`, `Transfer-Encoding`, and every hop-by-hop field are removed; the upstream bytes read the same to two independent parsers | `tests/attacks_sockets.rs` (`test_t1_smuggling_vectors_never_reach_the_upstream`, `test_t1_a_request_in_a_body_stays_a_body`); `tests/differential.rs` (20,000 generated requests; idea I-6); the `differential` fuzz target | writing the head again: about 240 ns for 6 fields |
 | T-2 | Response desync from an upstream | strict client-side parsing; responses written again; bytes after a complete response close the connection and are reported (idea I-2); ambiguous framing answers 502 | `tests/proxying.rs` (`test_bytes_after_a_response_count_as_desync`, `test_ambiguous_upstream_framing_is_502`); the `upstream_response` fuzz target | none on the good path |
-| T-3 | Spoofed forwarding headers | the forwarding set (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, and the rest) is always removed and rebuilt from the real client; append mode keeps only what the inbound side's trusted proxies added | `tests/attacks.rs` (`test_t3_spoofed_forwarding_headers_are_rebuilt`); `tests/attacks_suite.rs` (`test_t22_*`); the `forwarded_append` fuzz target | part of the head rewrite |
+| T-3 | Spoofed forwarding headers | the forwarding set (`Forwarded`, `X-Forwarded-*`, `X-Real-IP`, and the rest) is always removed and rebuilt from the real client; append mode keeps only what the inbound side's trusted proxies added; the host in each `Forwarded` element is quoted unless it is a token, so a client's `Host` cannot end the pair | `tests/attacks.rs` (`test_t3_spoofed_forwarding_headers_are_rebuilt`); `tests/attacks_suite.rs` (`test_t22_*`); `test_forwarded_host_cannot_forge_an_element`; the `forwarded_append` fuzz target | part of the head rewrite |
 | T-4 | Desync through a body on `GET`, `HEAD`, `TRACE`, `CONNECT` | refused by default (400) | `tests/attacks.rs` (`test_t4_body_on_get_is_refused`) | 0 |
 | T-5 | Header injection through rules or values | rules are checked when the configuration is built; values are checked again when written | `tests/attacks.rs` (`test_t5_header_injection_through_rules_is_refused_at_build`) | 0 per request |
 | T-6 | `Connection` naming the proxy's own fields | the proxy's fields are added after hop-by-hop removal, so a client cannot strip them | `tests/attacks.rs` (`test_t6_connection_cannot_strip_the_proxys_fields`) | 0 |
@@ -126,9 +126,36 @@ Results of the 24-hour runs:
 
 | Run | Result |
 |---|---|
-| Fuzz, 9 targets, 24 hours each | in progress |
-| Soak, Linux, 24 hours | in progress |
-| Soak, Windows, 24 hours | in progress |
+| Fuzz `endpoint`, 24 hours | 21.7 billion inputs, no findings |
+| Fuzz `route_match`, 24 hours | 9.7 billion inputs, no findings |
+| Fuzz `path_check`, 24 hours | 6.6 billion inputs, no findings |
+| Fuzz `exchange`, 24 hours | 6.2 billion inputs, no findings |
+| Fuzz `request_fields`, 24 hours | 2.3 billion inputs, no findings |
+| Fuzz `route_pattern`, 24 hours | 1.8 billion inputs, no findings |
+| Fuzz `upstream_response`, 24 hours | 747 million inputs, no findings |
+| Fuzz `forwarded_append` | stopped after 2.5 hours on a real bug, fixed below; running 24 hours again on the fix |
+| Fuzz `differential` | stopped after 8 hours on a fault in the test's own oracle, fixed below; running 24 hours again |
+| Soak, Linux, 24 hours | passed: 590 million requests, none stuck, no unexpected status, live heap grew 4.4% over the second half (limit 10%) |
+| Soak, Windows, 24 hours | passed: 524 million requests, none stuck, no unexpected status, live heap grew 6.2% over the second half; 107 connects refused by the client's own port table (counted apart) |
+
+Both soaks ran at 6,000 requests per second with a flapping origin, endpoint
+changes every 2 minutes, and a reload every 10. Aborted and refused requests
+are the harness's own, on purpose.
+
+Findings:
+
+- **A client's `Host` could add an element to `Forwarded`** (`forwarded_append`).
+  A `reg-name` may hold `,`, `;`, and `=`, and the writer put the host into
+  the `Forwarded` element without quotes. `Host: x,proto=https` reached the
+  upstream as `...;host=x,proto=https`: a second element, of the client's
+  making, saying the request came over HTTPS. An empty host gave a value that
+  did not parse. Every release before 0.7.0 has this. The host is now written
+  by proxy-net, quoted unless it is a token, for its own element and for
+  elements kept from trusted proxies; unit tests cover both.
+- **The differential oracle counted every `Expect` field as removed**
+  (`differential`). Only `Expect: 100-continue` is the inbound side's to
+  answer; other expectations are end to end and go through. The oracle now
+  checks that one value, and the input is a test case.
 
 ---
 

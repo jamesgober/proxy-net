@@ -46,6 +46,18 @@ and the memory an exchange holds.
 - `docs/SECURITY.md`: the threat model, every threat with its defence, its
   test, and its cost, the settings that matter, and the hardening record.
 
+### Fixed
+
+- A client's `Host` could add an element to `Forwarded`: a host name may
+  hold `,`, `;`, and `=`, and it was written without quotes, so
+  `Host: x,proto=https` reached the upstream as a second element of the
+  client's making. An empty host gave a value that did not parse. The host
+  is now quoted unless it is a token, in the proxy's own element and in
+  elements kept from trusted proxies. Found by the 24-hour `forwarded_append`
+  fuzz run.
+- The differential oracle counted every `Expect` field as removed; only
+  `Expect: 100-continue` is.
+
 ### Changed
 
 - serve-net 0.8.3, which fixes WebSocket messages that could wait for the
