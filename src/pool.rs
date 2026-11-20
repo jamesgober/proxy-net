@@ -1034,6 +1034,7 @@ pub struct PoolLimits {
     idle_timeout: Duration,
     max_exchanges_per_connection: u32,
     fresh_for: Duration,
+    adaptive: bool,
 }
 
 impl Default for PoolLimits {
@@ -1045,6 +1046,7 @@ impl Default for PoolLimits {
             idle_timeout: Duration::from_secs(4),
             max_exchanges_per_connection: 1000,
             fresh_for: Duration::from_secs(1),
+            adaptive: false,
         }
     }
 }
@@ -1087,6 +1089,24 @@ impl PoolLimits {
     pub fn fresh_for(mut self, d: Duration) -> PoolLimits {
         self.fresh_for = d;
         self
+    }
+
+    /// Experimental: an adaptive concurrency limit per endpoint, below the
+    /// endpoint's connection cap. It follows the endpoint's latency: it
+    /// grows while recent latency stays within a quarter of the lowest
+    /// recently seen, and shrinks in proportion when it rises, so requests
+    /// past the point where the endpoint starts queueing are answered 503
+    /// at once instead of queueing inside it. A refusal does not count
+    /// against the endpoint's health. Off by default; see
+    /// `docs/PERFORMANCE.md` for what it did in the load sweeps.
+    pub fn adaptive_concurrency(mut self, on: bool) -> PoolLimits {
+        self.adaptive = on;
+        self
+    }
+
+    /// Whether the adaptive limit is on.
+    pub fn adaptive_concurrency_value(&self) -> bool {
+        self.adaptive
     }
 
     /// The pending cap.

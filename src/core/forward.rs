@@ -439,6 +439,45 @@ fn push_via(pseudonym: &str, out: &mut FieldList) {
     });
 }
 
+/// Writes one `Forwarded` element: `for`, `proto`, and `by` through
+/// parse-net, then `host` here, quoted unless it is a token.
+///
+/// parse-net 0.7 writes a host name bare. A `reg-name` may be empty or hold
+/// `,`, `;`, `=`, `(`, and `)`; written bare, the value does not parse, or a
+/// client's `Host` such as `x,proto=https` ends the pair and forges an element
+/// of its own. Nothing is left in `out` on `Err`, which is also returned for
+/// a host holding a byte no quoted string may carry unescaped (no valid host
+/// does).
+fn write_element(e: &Element<'_>, out: &mut Vec<u8>) -> Result<(), ()> {
+    let start = out.len();
+    let rest = Element { host: None, ..*e };
+    if parse_net::forwarded::write_element(&rest, out).is_err() {
+        out.truncate(start);
+        return Err(());
+    }
+    let Some(h) = &e.host else {
+        return Ok(());
+    };
+    if out.len() > start {
+        out.push(b';');
+    }
+    out.extend_from_slice(b"host=");
+    let at = out.len();
+    if h.write_to(out).is_err()
+        || out[at..]
+            .iter()
+            .any(|&b| b == b'"' || b == b'\\' || !(0x21..0x7f).contains(&b))
+    {
+        out.truncate(start);
+        return Err(());
+    }
+    if !crate::syntax::is_token(&out[at..]) {
+        out.insert(at, b'"');
+        out.push(b'"');
+    }
+    Ok(())
+}
+
 /// The elements of the incoming chain added by trusted proxies: the last
 /// `hops` of `Forwarded` (re-serialized) and of `X-Forwarded-For`. `None`
 /// when either does not parse (the chain is then replaced, as when it is not
@@ -462,7 +501,7 @@ fn trusted_chain<F: FieldSource + ?Sized>(
         let all: Vec<_> = parsed.iter().collect();
         for e in all.iter().skip(all.len().saturating_sub(usize::from(hops))) {
             let mut v = Vec::new();
-            parse_net::forwarded::write_element(e, &mut v).ok()?;
+            write_element(e, &mut v).ok()?;
             elements.push(v);
         }
     }
@@ -549,10 +588,10 @@ fn push_forwarding<F: FieldSource + ?Sized>(
                 }
             }
             let start = value.len();
-            if parse_net::forwarded::write_element(&element, value).is_err() {
+            if write_element(&element, value).is_err() {
                 value.truncate(start);
-                // The host did not fit the grammar: write the element
-                // without it.
+                // The host could not be written: write the element without
+                // it.
                 let element = Element {
                     host: None,
                     ..element
@@ -941,6 +980,64 @@ mod tests {
         let c = config(one(Route::any()).forwarded(Forwarded::standard()));
         let (out, _) = run(&c, &[], bad);
         assert_eq!(out.get("forwarded"), Some(&b"for=unknown;proto=http"[..]));
+    }
+
+    #[test]
+    fn test_forwarded_host_cannot_forge_an_element() {
+        // A reg-name may hold `,`, `;`, and `=`: written bare, the client's
+        // Host would end the pair and add an element of its own, such as one
+        // saying the request came over HTTPS.
+        let c = config(one(Route::any()).forwarded(Forwarded::standard()));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let limits = parse_net::Limits::DEFAULT;
+        let cases: [(&[u8], &[u8]); 6] = [
+            (
+                b"x,proto=https",
+                b"for=192.0.2.9;proto=http;host=\"x,proto=https\"",
+            ),
+            (
+                b"x,for=_spoofed",
+                b"for=192.0.2.9;proto=http;host=\"x,for=_spoofed\"",
+            ),
+            (
+                b"example.com:",
+                b"for=192.0.2.9;proto=http;host=example.com",
+            ),
+            (b"", b"for=192.0.2.9;proto=http;host=\"\""),
+            (b"example.com", b"for=192.0.2.9;proto=http;host=example.com"),
+            (b"192.0.2.1", b"for=192.0.2.9;proto=http;host=192.0.2.1"),
+        ];
+        for (host, want) in cases {
+            let facts = ForwardFacts::new(b"GET", b"/", host, e).client("192.0.2.9:1".parse().ok());
+            let (out, _) = run(&c, &[], facts);
+            let fwd = out.get("forwarded").expect("forwarded");
+            assert_eq!(fwd, want, "{:?}", core::str::from_utf8(fwd));
+            let lines = [fwd];
+            let parsed = parse_net::forwarded::parse(&lines, &limits).expect("parses");
+            assert_eq!(parsed.iter().count(), 1, "{:?}", core::str::from_utf8(fwd));
+        }
+        // The same for a trusted proxy's element, re-serialized in append mode.
+        let c = config(one(Route::any()).forwarded(Forwarded::standard().append_trusted()));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        for (incoming, kept) in [
+            (
+                &b"for=1.1.1.1;host=\"a,proto=https\""[..],
+                &b"for=1.1.1.1;host=\"a,proto=https\""[..],
+            ),
+            (b"Host=\"\"", b"host=\"\""),
+        ] {
+            let facts = ForwardFacts::new(b"GET", b"/", b"h", e)
+                .client("192.0.2.9:1".parse().ok())
+                .chain("10.1.1.1:2".parse().ok(), 1);
+            let (out, _) = run(&c, &[("Forwarded", incoming)], facts);
+            let fwd = out.get("forwarded").expect("forwarded");
+            let mut want = kept.to_vec();
+            want.extend_from_slice(b", for=10.1.1.1;proto=http;host=h");
+            assert_eq!(fwd, &want[..], "{:?}", core::str::from_utf8(fwd));
+            let lines = [fwd];
+            let parsed = parse_net::forwarded::parse(&lines, &limits).expect("parses");
+            assert_eq!(parsed.iter().count(), 2);
+        }
     }
 
     #[test]

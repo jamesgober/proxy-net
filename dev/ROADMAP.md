@@ -59,10 +59,16 @@
 - [x] `wss` upstreams through the WebSocket bridge (moved from 0.5, D-048; built without the reactor, D-058).
 - Moved, with the reason in PLAN D-065: the reactor path. serve-net G-1 and net-io G-11 are still open (serve-net 0.8.2 and net-io 0.8.1 are the newest on 2026-11-19); it comes in the first version after both close. This is a hard external dependency, not a deferral by choice.
 
-## v0.7.0 - Hardening
-- [ ] 24-hour fuzz campaign per target, the full attack suite, the multi-node test, a 24-hour soak, idea I-6, `docs/SECURITY.md`.
-- [ ] Memory per active exchange measured under load with the soak (the 1.0 target is under 20 KiB); 0.6 measured allocations per request, not the heap an exchange holds.
-- [ ] Idea I-5 on sockets: a load sweep against a real endpoint with a knee; if it agrees with the simulation, an opt-in adaptive limit per pool (D-063).
+## v0.7.0 - Hardening (2026-11-20)
+- [ ] 24-hour fuzz campaign per target (nine targets, `differential` included). Seven ran 24 hours with no findings. `forwarded_append` found a real bug after 2.5 hours (a client's `Host` could add a `Forwarded` element; fixed, D-073) and `differential` a fault in its oracle after 8 hours (fixed, D-074); both run 24 hours again on the fix, from 2026-11-20 19:35 UTC, and this box is checked when they end clean.
+- [x] 24-hour soak on Linux and on Windows on serve-net 0.8.3 (`benches/soak.rs`, D-071, D-072): both passed at e27f228 (590 and 524 million requests, live heap growth 4.4% and 6.2% over the second half).
+- [x] The full attack suite: every threat T-1 to T-22 has a named test (`tests/attacks_suite.rs` adds T-8, T-9, T-12, T-16, T-18, T-19, T-21, T-22; D-069).
+- [x] The multi-node test (`tests/multi_node.rs`: a chain, a loop, failover).
+- [x] Idea I-6 (`tests/differential.rs`, the `differential` fuzz target; D-070).
+- [x] `docs/SECURITY.md`.
+- [x] Memory per active exchange: 27.3 KiB by default, 15.3 KiB with `Inbound::read_buffer(4096)`, under the 20 KiB target (`tests/memory.rs`, D-067).
+- [x] Idea I-5 on sockets: it agrees with the simulation when clients back off on 503; shipped as an experimental opt-in, `PoolLimits::adaptive_concurrency` (D-068).
+- [x] serve-net 0.8.3 fixes G-16: proxy-net moved to it and the two pipelined bridge tests run again (D-072).
 
 ## v0.8.0 - Alpha
 - [ ] A gateway deployment uses proxy-net for its proxy and load-balancer roles end to end; `docs/OPERATIONS.md`, `docs/PLATFORM-NOTES.md`.

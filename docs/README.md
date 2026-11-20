@@ -25,6 +25,7 @@
 
 - [API reference](./API.md): every public item, with examples and the version it ships in.
 - [Architecture](./ARCHITECTURE.md): the layers, the threads, how a request moves through the proxy, and how live changes swap the running state.
+- [Security](./SECURITY.md): the threat model, every threat with its defence and its test, where proxy-net is stricter than the RFCs, the settings that matter, and the hardening record.
 - [Performance](./PERFORMANCE.md): proxy-net against nginx, HAProxy, and Envoy, allocations per request, the core's hot paths, and how each was measured.
 - [Release notes](./release/): one file per release.
 - [Changelog](../CHANGELOG.md)
@@ -32,7 +33,7 @@
 - [Roadmap](../dev/ROADMAP.md): what each version delivers, with its exit criteria.
 - [Directives](../dev/DIRECTIVES.md): the engineering standards and the definition of done.
 
-The security and platform guides arrive with the versions that build what they describe: `SECURITY.md` in 0.7, `PLATFORM-NOTES.md` in 0.8, and `STABILITY-1.0.md` with 1.0.
+The operations and platform guides arrive with 0.8, and `STABILITY-1.0.md` with 1.0.
 
 ## Help
 

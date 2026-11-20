@@ -101,14 +101,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-proxy-net = "0.6"
+proxy-net = "0.7"
 ```
 
 Without the standard library (the configuration types and the core only):
 
 ```toml
 [dependencies]
-proxy-net = { version = "0.6", default-features = false }
+proxy-net = { version = "0.7", default-features = false }
 ```
 
 | Feature | Enables | Default |
@@ -221,7 +221,7 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 
 ## **Status: Feature complete**
 
-**Current Version:** `0.6.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in. Every feature planned for 1.0 is in: forwarding, TLS and the PROXY protocol to upstreams, the WebSocket bridge (`wss` included), live reload, draining, discovery, slow start, and request ids. The request path is measured against nginx, HAProxy, and Envoy in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). What remains is hardening and time in service.
+**Current Version:** `0.7.0`. The public API is written in [`docs/API.md`](./docs/API.md), with the version each part ships in. Every feature planned for 1.0 is in: forwarding, TLS and the PROXY protocol to upstreams, the WebSocket bridge (`wss` included), live reload, draining, discovery, slow start, and request ids. The request path is measured against nginx, HAProxy, and Envoy in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). Every threat in the threat model has an attack test, listed in [`docs/SECURITY.md`](./docs/SECURITY.md) with the 24-hour fuzz and soak results. What remains is time in service.
 
 **Target:** `1.0.0`, after the roadmap in [`dev/ROADMAP.md`](./dev/ROADMAP.md).
 
@@ -238,14 +238,15 @@ assert_eq!(err.to_string(), "pool \"db\" endpoint 0: the port is missing (write 
 - **Performance** - buffers kept per worker (10 allocations per proxied request), a connection pool with no system call under its lock, a host index for routes, and benchmarks against other proxies.
 - **Live changes** - reload, endpoint replacement, draining, discovery with an allowlist, slow start.
 - **Request ids and append mode** - a request id field kept or written, and forwarding chains from trusted proxies kept.
+- **Hardening** - an attack test for every threat, chains and failover across several proxies, the upstream bytes checked against a second parser, 24-hour fuzzing and soaks, and the memory an exchange holds.
 
 **What's planned**:
-- `0.7.0`: long fuzz campaigns, soak tests, and the security guide.
+- `0.8.0`: a gateway deployment using proxy-net end to end, and the operations and platform guides.
 
 **Performance targets** for 1.0.0, measured in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md):
 - **Route match** under 50 ns for 32 routes, with no allocation: 39 ns, none.
 - **Added latency** under 30 µs at p50 for a small request over a kept-alive connection: 25 µs on a desktop, 42 µs on a 4-CPU Linux runner (nginx adds 39 µs there).
-- **Memory** under 20 KiB per active exchange: measured with the soak tests in 0.7.
+- **Memory** under 20 KiB per active exchange: 15.3 KiB with 4 KiB client reads (`Inbound::read_buffer`), 27.3 KiB with the default 16 KiB.
 - **Throughput** under concurrency is about two thirds of nginx's on a 4-CPU runner, held back by one blocking thread per connection until the reactor path lands.
 
 **Note on API stability**: the API in `docs/API.md` is locked from 0.2. Names and signatures change only with a migration note. The `1.0.0` release will commit to the stability contract in `docs/STABILITY-1.0.md`.

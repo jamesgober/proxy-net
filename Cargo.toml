@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "proxy-net"
-version = "0.6.0"
+version = "0.7.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -53,6 +53,12 @@ required-features = ["serve"]
 name = "core"
 harness = false
 
+# The long soak (see the file's header); `--minutes` sets its length.
+[[bench]]
+name = "soak"
+harness = false
+required-features = ["serve"]
+
 
 # FEATURE FLAGS
 # #################################
@@ -85,7 +91,7 @@ http-net = { version = "0.10", default-features = false, optional = true }
 # Outbound TCP connections, deadlines, and the PROXY encoders.
 net-io = { version = "0.8.1", default-features = false, features = ["proxy"], optional = true }
 # The inbound engine.
-serve-net = { version = "0.8.2", default-features = false, features = ["http1"], optional = true }
+serve-net = { version = "0.8.3", default-features = false, features = ["http1"], optional = true }
 # TLS to upstreams. Its net-io seam is off: proxy-net drives the stream over
 # its own net-io connection.
 tls-net = { version = "0.10", default-features = false, features = ["aws-lc", "webpki-roots"], optional = true }

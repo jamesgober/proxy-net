@@ -25,6 +25,8 @@ pub(crate) struct PoolRuntime {
     pub budget: RetryBudget,
     pub conns: Box<[Arc<EndpointConns>]>,
     pub connector: Arc<dyn Connector>,
+    /// Per endpoint, the adaptive concurrency limit when the pool has one.
+    pub adaptive: Option<Box<[crate::core::adaptive::GradientLimit]>>,
     /// The pool's TLS settings as a connector, for the WebSocket bridge,
     /// which drives its own sockets.
     #[cfg(all(feature = "tls", feature = "ws"))]
@@ -159,7 +161,17 @@ impl Runtime {
             let (connector, tls) = connector_for(p, custom)?;
             #[cfg(not(all(feature = "tls", feature = "ws")))]
             let (connector, _) = connector_for(p, custom)?;
+            let adaptive = p.limits().adaptive_concurrency_value().then(|| {
+                p.endpoints()
+                    .iter()
+                    .map(|e| {
+                        let cap = e.max_connections_value().max(1);
+                        crate::core::adaptive::GradientLimit::new(cap.min(32), cap.min(4), cap)
+                    })
+                    .collect()
+            });
             pools.push(PoolRuntime {
+                adaptive,
                 balancer,
                 health,
                 budget: RetryBudget::new(p.retry()),
