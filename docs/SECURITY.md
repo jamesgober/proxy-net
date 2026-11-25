@@ -133,8 +133,8 @@ Results of the 24-hour runs:
 | Fuzz `request_fields`, 24 hours | 2.3 billion inputs, no findings |
 | Fuzz `route_pattern`, 24 hours | 1.8 billion inputs, no findings |
 | Fuzz `upstream_response`, 24 hours | 747 million inputs, no findings |
-| Fuzz `forwarded_append` | stopped after 2.5 hours on a real bug, fixed below; running 24 hours again on the fix |
-| Fuzz `differential` | stopped after 8 hours on a fault in the test's own oracle, fixed below; running 24 hours again |
+| Fuzz `forwarded_append` | stopped after 2.5 hours on a real bug, fixed below; again after 35 minutes on the fix, on a second one, fixed below; running 24 hours again |
+| Fuzz `differential` | stopped after 8 hours on a fault in the test's own oracle, fixed below; the rerun ended at 7.8 hours, with no finding, when the machine's Linux environment was stopped; running 24 hours again |
 | Soak, Linux, 24 hours | passed: 590 million requests, none stuck, no unexpected status, live heap grew 4.4% over the second half (limit 10%) |
 | Soak, Windows, 24 hours | passed: 524 million requests, none stuck, no unexpected status, live heap grew 6.2% over the second half; 107 connects refused by the client's own port table (counted apart) |
 
@@ -156,6 +156,13 @@ Findings:
   (`differential`). Only `Expect: 100-continue` is the inbound side's to
   answer; other expectations are end to end and go through. The oracle now
   checks that one value, and the input is a test case.
+- **A full trusted chain made a header upstreams refuse** (`forwarded_append`,
+  on the rerun). In append mode, a trusted `Forwarded` or `X-Forwarded-For`
+  chain already at 16 entries, the most parse-net's default limits accept,
+  became 17 with this hop, and an upstream applying the same limit refused
+  the whole header. A kept chain now leaves room for this hop: past 15
+  entries it keeps the first (the client the outermost trusted proxy saw)
+  and the most recent ones. A unit test covers both headers.
 
 ---
 

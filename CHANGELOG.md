@@ -55,6 +55,10 @@ and the memory an exchange holds.
   is now quoted unless it is a token, in the proxy's own element and in
   elements kept from trusted proxies. Found by the 24-hour `forwarded_append`
   fuzz run.
+- A trusted `Forwarded` or `X-Forwarded-For` chain already at 16 entries
+  became 17 with this hop in append mode, which parse-net's default limits
+  refuse. A kept chain now leaves room for this hop, keeping its first entry
+  and the most recent ones.
 - The differential oracle counted every `Expect` field as removed; only
   `Expect: 100-continue` is.
 

@@ -499,9 +499,10 @@ fn trusted_chain<F: FieldSource + ?Sized>(
     if !fwd.is_empty() {
         let parsed = parse_net::forwarded::parse(&fwd, &limits).ok()?;
         let all: Vec<_> = parsed.iter().collect();
-        for e in all.iter().skip(all.len().saturating_sub(usize::from(hops))) {
+        let kept = &all[all.len().saturating_sub(usize::from(hops))..];
+        for e in leave_room(kept) {
             let mut v = Vec::new();
-            write_element(e, &mut v).ok()?;
+            write_element(&e, &mut v).ok()?;
             elements.push(v);
         }
     }
@@ -510,9 +511,30 @@ fn trusted_chain<F: FieldSource + ?Sized>(
     if !xff.is_empty() {
         let parsed = parse_net::forwarded::parse_x_forwarded_for(&xff, &limits).ok()?;
         let all: Vec<IpAddr> = parsed.iter().map(|(ip, _)| ip).collect();
-        addrs.extend_from_slice(&all[all.len().saturating_sub(usize::from(hops))..]);
+        addrs.extend(leave_room(
+            &all[all.len().saturating_sub(usize::from(hops))..],
+        ));
     }
     Some((elements, addrs))
+}
+
+/// The most entries a forwarded chain may have and still parse with
+/// parse-net's default limits (`Limits::DEFAULT`, 16 hops), which upstreams
+/// built on it apply too.
+const MAX_CHAIN: usize = 16;
+
+/// The kept part of a trusted chain, with room for this hop: at most
+/// `MAX_CHAIN - 1` entries. A longer chain keeps its first entry (the client
+/// the outermost trusted proxy saw) and its most recent ones; the proxies in
+/// between are dropped, so the header still parses upstream.
+fn leave_room<T: Copy>(kept: &[T]) -> impl Iterator<Item = T> + '_ {
+    let room = MAX_CHAIN - 1;
+    let skip = kept.len().saturating_sub(room);
+    let (first, rest) = match kept.split_first() {
+        Some((f, r)) if skip > 0 => (Some(*f), &r[skip..]),
+        _ => (None, kept),
+    };
+    first.into_iter().chain(rest.iter().copied())
 }
 
 fn push_forwarding<F: FieldSource + ?Sized>(
@@ -1038,6 +1060,62 @@ mod tests {
             let parsed = parse_net::forwarded::parse(&lines, &limits).expect("parses");
             assert_eq!(parsed.iter().count(), 2);
         }
+    }
+
+    #[test]
+    fn test_a_full_trusted_chain_still_parses_upstream() {
+        // A chain already at parse-net's limit of 16: keeping all of it and
+        // adding this hop would make 17, which the same parser refuses.
+        let c = config(one(Route::any()).forwarded(Forwarded::both().append_trusted()));
+        let e = &c.pool("p").expect("p").endpoints()[0];
+        let fwd: Vec<String> = (1..=16).map(|i| format!("for=10.0.0.{i}")).collect();
+        let fwd = fwd.join(", ");
+        let xff: Vec<String> = (1..=16).map(|i| format!("10.0.0.{i}")).collect();
+        let xff = xff.join(", ");
+        let facts = ForwardFacts::new(b"GET", b"/", b"h", e)
+            .client("192.0.2.9:1".parse().ok())
+            .chain("10.9.9.9:2".parse().ok(), 255);
+        let (out, _) = run(
+            &c,
+            &[
+                ("Forwarded", fwd.as_bytes()),
+                ("X-Forwarded-For", xff.as_bytes()),
+            ],
+            facts,
+        );
+        let limits = parse_net::Limits::DEFAULT;
+        let lines = [out.get("forwarded").expect("forwarded")];
+        let parsed = parse_net::forwarded::parse(&lines, &limits).expect("parses");
+        let all: Vec<_> = parsed.iter().collect();
+        assert_eq!(all.len(), 16);
+        let ip = |e: &Element<'_>| match e.for_ {
+            Some(Node::Addr(ip, _)) => ip.to_string(),
+            other => format!("{other:?}"),
+        };
+        // The first (the client) and the most recent hops are kept.
+        assert_eq!(ip(&all[0]), "10.0.0.1");
+        assert_eq!(ip(&all[1]), "10.0.0.3");
+        assert_eq!(ip(&all[14]), "10.0.0.16");
+        assert_eq!(ip(&all[15]), "10.9.9.9");
+        let xff_lines = [out.get("x-forwarded-for").expect("xff")];
+        let parsed =
+            parse_net::forwarded::parse_x_forwarded_for(&xff_lines, &limits).expect("parses");
+        let addrs: Vec<String> = parsed.iter().map(|(ip, _)| ip.to_string()).collect();
+        assert_eq!(addrs.len(), 16);
+        assert_eq!(
+            (addrs[0].as_str(), addrs[15].as_str()),
+            ("10.0.0.1", "10.9.9.9")
+        );
+        // A chain with room is kept whole.
+        let short = "for=10.0.0.1, for=10.0.0.2";
+        let facts = ForwardFacts::new(b"GET", b"/", b"h", e)
+            .client("192.0.2.9:1".parse().ok())
+            .chain("10.9.9.9:2".parse().ok(), 255);
+        let (out, _) = run(&c, &[("Forwarded", short.as_bytes())], facts);
+        assert_eq!(
+            out.get("forwarded"),
+            Some(&b"for=10.0.0.1, for=10.0.0.2, for=10.9.9.9;proto=http;host=h"[..])
+        );
     }
 
     #[test]
