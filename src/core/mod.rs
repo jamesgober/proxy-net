@@ -7,7 +7,7 @@
 //! and [`Exchange`], the forwarding state machine. The upstream client and
 //! the serve-net service that drive it arrive in `0.4.0`.
 
-mod adaptive;
+pub(crate) mod adaptive;
 mod atomic;
 mod balance;
 mod budget;

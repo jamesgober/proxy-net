@@ -6,6 +6,7 @@
 //! cargo bench --bench compare -- origin 127.0.0.1:9000 [--body N]
 //! cargo bench --bench compare -- proxy 127.0.0.1:8080 127.0.0.1:9000
 //! cargo bench --bench compare -- load 127.0.0.1:8080 [--connections N] [--seconds S] [--label NAME]
+//! cargo bench --bench compare -- knee [--seconds S]       # the adaptive-limit sweep (idea I-5)
 //! ```
 //!
 //! The load generator keeps `connections` keep-alive connections, each
@@ -60,10 +61,100 @@ fn main() {
                 target,
                 number("--connections", 64),
                 Duration::from_secs(number("--seconds", 10) as u64),
+                Duration::ZERO,
             );
             println!("{}", r.row(&label));
         }
+        Some("knee") => knee(number("--seconds", 5) as u64),
         _ => in_process(number("--seconds", 5) as u64),
+    }
+}
+
+/// Idea I-5 over sockets: an origin that serves 32 requests at once, about
+/// 1 ms each, and queues the rest inside itself; proxy-net in front of it
+/// with the default connection cap and with the adaptive limit; the same
+/// closed-loop load swept from 16 to 192 clients. Refusals (503) are the
+/// errors column.
+fn knee(seconds: u64) {
+    use std::sync::{Condvar, Mutex};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let origin = listener.local_addr().expect("addr");
+    let permits = Arc::new((Mutex::new(32usize), Condvar::new()));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let permits = Arc::clone(&permits);
+            std::thread::spawn(move || {
+                let _ = s.set_nodelay(true);
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut filled = 0;
+                loop {
+                    let n = match s.read(&mut buf[filled..]) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    filled += n;
+                    while let Some(end) = head_end(&buf[..filled]) {
+                        {
+                            let (lock, freed) = &*permits;
+                            let mut free = lock
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            while *free == 0 {
+                                free = freed
+                                    .wait(free)
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            }
+                            *free -= 1;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        {
+                            let (lock, freed) = &*permits;
+                            *lock
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+                            freed.notify_one();
+                        }
+                        if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .is_err()
+                        {
+                            return;
+                        }
+                        buf.copy_within(end..filled, 0);
+                        filled -= end;
+                    }
+                }
+            });
+        }
+    });
+    let start = |adaptive: bool| {
+        proxy_net::ProxyBuilder::new()
+            .pool(
+                "origin",
+                proxy_net::Pool::new([origin.to_string()])
+                    .limits(proxy_net::PoolLimits::default().adaptive_concurrency(adaptive)),
+            )
+            .build()
+            .and_then(|p| p.serve_with("127.0.0.1:0", inbound()))
+            .expect("proxy")
+    };
+    let fixed = start(false);
+    let adaptive = start(true);
+    println!("{}", Report::header());
+    for (back_off, clients) in [16, 32, 64, 128, 192]
+        .into_iter()
+        .flat_map(|c| [(Duration::ZERO, c), (Duration::from_millis(1), c)])
+    {
+        let tag = if back_off.is_zero() {
+            "retry at once"
+        } else {
+            "1 ms back-off"
+        };
+        for (label, running) in [("default cap", &fixed), ("adaptive", &adaptive)] {
+            let addr = running.local_addr().expect("addr");
+            let r = load(addr, clients, Duration::from_secs(seconds), back_off);
+            println!("{}", r.row(&format!("{label}, {clients} clients, {tag}")));
+        }
     }
 }
 
@@ -81,7 +172,12 @@ fn in_process(seconds: u64) {
     println!("{}", Report::header());
     for connections in [1, 16, 64] {
         for (label, target) in [("direct", origin), ("proxy-net", proxy)] {
-            let r = load(target, connections, Duration::from_secs(seconds));
+            let r = load(
+                target,
+                connections,
+                Duration::from_secs(seconds),
+                Duration::ZERO,
+            );
             println!("{}", r.row(&format!("{label}, {connections} conn")));
         }
     }
@@ -164,8 +260,9 @@ impl Reader {
         self.filled -= n;
     }
 
-    /// Reads one whole response; `Some(true)` when the connection stays open.
-    fn response(&mut self, s: &mut TcpStream) -> Option<bool> {
+    /// Reads one whole response: its status, and whether the connection
+    /// stays open.
+    fn response(&mut self, s: &mut TcpStream) -> Option<(u16, bool)> {
         let end = loop {
             if let Some(e) = head_end(&self.buf[..self.filled]) {
                 break e;
@@ -173,9 +270,7 @@ impl Reader {
             self.more(s)?;
         };
         let head = String::from_utf8_lossy(&self.buf[..end]).to_ascii_lowercase();
-        if !head.starts_with("http/1.1 200") {
-            return None;
-        }
+        let status: u16 = head.get(9..12)?.parse().ok()?;
         let keep = !head.contains("\r\nconnection: close");
         let length = head
             .split("\r\n")
@@ -218,7 +313,7 @@ impl Reader {
                 }
             },
         }
-        Some(keep)
+        Some((status, keep))
     }
 }
 
@@ -261,7 +356,9 @@ impl Report {
 
 /// `connections` closed-loop clients against `target` for `run`, after a
 /// one-second warm-up that is not counted.
-fn load(target: SocketAddr, connections: usize, run: Duration) -> Report {
+/// `back_off` is how long a client waits after a refusal before its next
+/// request (zero: at once).
+fn load(target: SocketAddr, connections: usize, run: Duration, back_off: Duration) -> Report {
     let measuring = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let workers: Vec<_> = (0..connections)
@@ -292,10 +389,23 @@ fn load(target: SocketAddr, connections: usize, run: Duration) -> Report {
                     let took = start.elapsed();
                     let counted = measuring.load(Ordering::Relaxed);
                     match outcome {
-                        Some(keep) => {
+                        Some((200, keep)) => {
                             if counted {
                                 requests += 1;
                                 latencies.push(u32::try_from(took.as_micros()).unwrap_or(u32::MAX));
+                            }
+                            if !keep {
+                                conn = None;
+                            }
+                        }
+                        // Any other status (a refusal) counts as an error and
+                        // keeps the connection when it may.
+                        Some((_, keep)) => {
+                            if counted {
+                                errors += 1;
+                            }
+                            if !back_off.is_zero() {
+                                std::thread::sleep(back_off);
                             }
                             if !keep {
                                 conn = None;

@@ -15,7 +15,7 @@
 <br>
 
 > What proxy-net costs, how it was measured, and how it compares with other
-> proxies. Version `0.6.0`. Every number here comes from a benchmark or test
+> proxies. Version `0.7.0`. Every number here comes from a benchmark or test
 > in this repository; how to run each one is below its table.
 
 ## Against other proxies
@@ -130,6 +130,23 @@ and 3 are the method, target, and `Host` copies in `RequestParts`. serve-net
 and http-net's response parsing make none. The test fails above 12 per
 request, and on any allocation in route matching, on every platform CI runs.
 
+## Memory per active exchange
+
+`tests/memory.rs` holds 64 requests at the origin at once and counts the
+proxy's live heap (serve-net, http-net, net-io, and proxy-net) against the
+idle proxy's; the origin's and the clients' threads are not counted. Thread
+stacks are not heap.
+
+| Client read buffer | Heap per active exchange | Of which |
+|---:|---:|---|
+| 16 KiB (default) | 27.3 KiB | the client connection's read buffer 16 KiB, http-net's buffers 4 KiB each side, serve-net's connection 1 KiB, the rest under 1 KiB each |
+| 4 KiB | 15.3 KiB | the same with a 4 KiB read buffer |
+
+The default stays at 16 KiB (D-067): 4 KiB reads took a 1 MiB upload from
+about 1.1 GB/s to 500 MiB/s per connection, and blocking workers hold at
+most a few hundred connections, so the saving is a few MB per proxy. The
+test fails above 32 KiB by default and above 20 KiB with 4 KiB reads.
+
 ## The core's hot paths
 
 `cargo bench --bench core`: the median of 15 timed loops, per operation, on
@@ -164,9 +181,10 @@ their text nor their size.
 
 ## Adaptive concurrency (idea I-5)
 
-A gradient concurrency limit, tried in a simulation against an endpoint
-that queues past 32 concurrent requests (about 32,000 requests per second at
-1 ms each). It is not used by pools yet (D-063).
+A gradient concurrency limit per endpoint, `PoolLimits::adaptive_concurrency`
+(experimental, off by default). First a simulation against an endpoint that
+queues past 32 concurrent requests (about 32,000 requests per second at
+1 ms each), clients waiting 1 ms after a refusal:
 
 | Clients | Default cap (256): p99 | Gradient: throughput | Gradient: p99 |
 |---:|---:|---:|---:|
@@ -179,8 +197,27 @@ that queues past 32 concurrent requests (about 32,000 requests per second at
 
 A cap set exactly at the knee gives 1.2 ms at every load; the gradient limit
 does not need to know where the knee is, but it lets the queue creep. The
-simulation is `src/core/adaptive.rs`; the next step is the same sweep over
-sockets.
+simulation is `src/core/adaptive.rs`.
+
+Then over sockets (`cargo bench --bench compare -- knee`): an origin that
+serves 32 requests at once for about 1 ms each and queues the rest inside
+itself, proxy-net with the default cap and with the adaptive limit, on Linux
+(WSL 2, a busy 32-thread machine), 4 seconds per row:
+
+| Clients | Default cap: req/s, p99 | Adaptive, clients wait 1 ms after a 503 | Adaptive, clients retry at once |
+|---:|---:|---:|---:|
+| 16 | 11,861, 1.49 ms | 11,198, 1.62 ms | 11,966, 1.49 ms |
+| 32 | 22,229, 1.90 ms | 22,303, 1.81 ms | 22,365, 1.78 ms |
+| 64 | 27,008, 5.33 ms | 27,229, 2.96 ms | 25,601, 3.64 ms |
+| 128 | 27,166, 17.71 ms | 25,727, 4.43 ms | 17,578, 7.20 ms |
+| 192 | 27,050, 29.10 ms | 26,014, 4.14 ms | 10,465, 10.47 ms |
+
+With clients that back off, the sockets agree with the simulation: the
+capacity kept and p99 cut by up to 86% past the knee. With clients that
+retry a 503 at once, every refusal becomes another request, and on a busy
+machine the refusals cost up to 60% of throughput. Hence opt-in, off by
+default (D-068): it suits a deployment whose clients honour a 503 (proxy-net
+sends `Retry-After: 1` with it).
 
 ## The targets for 1.0
 
@@ -188,4 +225,4 @@ sockets.
 |---|---|
 | Route match under 50 ns for 32 routes, no allocation | 39 ns, none |
 | Added latency under 30 us at p50 for a small kept-alive request | 25 us on the Windows desktop; 42 us on the 4-CPU Linux runner (nginx adds 39 us there, HAProxy 19 us) |
-| Memory under 20 KiB per active exchange | not measured yet: it needs a heap snapshot per exchange under load, which comes with the soak tests in 0.7 |
+| Memory under 20 KiB per active exchange | 15.3 KiB with `Inbound::read_buffer(4096)`; 27.3 KiB with the default 16 KiB reads (below) |

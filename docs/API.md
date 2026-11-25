@@ -15,7 +15,7 @@
 <br>
 
 > Every public item of `proxy-net`: what it does, its parameters, its errors,
-> and examples. **Version `0.6.0`.** This file is the API
+> and examples. **Version `0.7.0`.** This file is the API
 > contract: items marked *shipped* are in this build; items marked with a
 > later version are the locked shape of what comes next, and their names and
 > signatures change only with a migration note.
@@ -116,6 +116,7 @@ proxy-net receives requests that serve-net has already admitted, picks an upstre
 | 0.4.0 | forwarding over real sockets: the serve-net service, the upstream client and connection pool, active health checks, Tier 1 (*shipped*) |
 | 0.5.0 | WebSocket bridge, TLS and the PROXY protocol to upstreams, live reload, draining, discovery, slow start, request ids (*shipped*) |
 | 0.6.0 | `wss` upstreams through the bridge, `Inbound` and `Proxy::serve_with`, buffers reused across exchanges (*shipped*) |
+| 0.7.0 | hardening: `Inbound::read_buffer`, the experimental `PoolLimits::adaptive_concurrency`, `EndpointHealth::adaptive_limit` (*shipped*) |
 
 ### Features
 
@@ -230,7 +231,8 @@ pub struct HealthSnapshot { pub pools: Vec<PoolHealth> }
 pub struct PoolHealth { pub name: Box<str>, pub endpoints: Vec<EndpointHealth> }
 pub struct EndpointHealth { pub addr: EndpointAddr, pub state: EndpointState, pub eligible: bool,
                             pub active: u32, pub open: u32, pub idle: u32, pub latency_ns: u64,
-                            pub ramp: u32 }   // slow-start share in percent, 100 when not ramping
+                            pub ramp: u32,    // slow-start share in percent, 100 when not ramping
+                            pub adaptive_limit: Option<u32> }   // 0.7: the adaptive limit, when on
 pub struct ProxyStats { pub exchanges: u64, pub succeeded: u64, pub failed: u64, pub retries: u64,
                         pub refused: u64, pub desyncs: u64 }
 ```
@@ -303,15 +305,18 @@ impl Inbound {
     pub const fn workers(self, n: u16) -> Inbound;          // blocking workers: the most clients at once
     pub const fn max_per_source(self, n: u32) -> Inbound;   // per IPv4 address or IPv6 /64
     pub const fn max_connections(self, n: u32) -> Inbound;  // below what the workers allow
+    pub const fn read_buffer(self, bytes: u32) -> Inbound;  // 0.7: 1 KiB to 64 KiB, a power of two
     pub const fn workers_value(&self) -> u16;
     pub const fn max_per_source_value(&self) -> u32;
     pub const fn max_connections_value(&self) -> Option<u32>;
+    pub const fn read_buffer_value(&self) -> u32;
 }
 ```
 
 - Each open client connection holds one worker. The per-source cap keeps one address from holding every worker; connections above it are closed as they arrive.
 - Behind a load balancer or another proxy every client arrives from a few addresses: raise `max_per_source` to what each of them carries. It can be at most the connection cap (`max_connections`, or the workers less serve-net's headroom: 224 of 256); above it the server refuses to start.
-- A zero setting is refused with `ProxyError::Inbound`.
+- `read_buffer` (0.7) is what each client connection reads into, 16 KiB by default. 4 KiB brings an active exchange from about 27 KiB of heap to about 15 KiB and halves upload throughput per connection (about 500 MiB/s against 1.1 GB/s); see `docs/PERFORMANCE.md`.
+- A zero setting, or a read buffer that is not a power of two from 1 KiB to 64 KiB, is refused with `ProxyError::Inbound`.
 
 ```rust
 let inbound = proxy_net::Inbound::new().workers(512).max_per_source(128);
@@ -1038,6 +1043,9 @@ let check = proxy_net::HealthCheck::http("/ready")
 | `idle_timeout` | 4 s | keep it below the endpoint's own keep-alive timeout |
 | `max_exchanges_per_connection` | 1,000 | then the connection is closed |
 | `fresh_for` | 1 s | a non-idempotent request only reuses a connection used this recently, so the keep-alive close race cannot lose it |
+| `adaptive_concurrency` | off | 0.7, experimental: an adaptive concurrency limit per endpoint below its cap (see below) |
+
+`adaptive_concurrency(true)` gives each endpoint a gradient limit (idea I-5). It grows while recent latency stays within a quarter of the lowest recently seen and shrinks in proportion when latency rises; the last window of every 32 runs at half the limit so the endpoint's queue drains and the floor stays honest. A request past the limit is answered 503 at once (`Breaker`), which does not count against the endpoint's health; the current limit is `EndpointHealth::adaptive_limit`. In the socket sweep (`docs/PERFORMANCE.md`) it kept 95 to 100% of throughput and cut p99 by up to 86% past an endpoint's knee when clients waited after a 503, and cost up to 60% of throughput when clients retried at once. It costs one compare-and-swap to admit and a few relaxed atomics per finished attempt.
 
 ### `Cidr`
 

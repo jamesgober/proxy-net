@@ -171,6 +171,8 @@ pub struct Forward {
     status: Option<u16>,
     failure: Option<ErrorClass>,
     over: bool,
+    /// The endpoint whose adaptive limit admitted this attempt, and when.
+    admitted: Option<(EndpointId, Instant)>,
 }
 
 impl std::fmt::Debug for Forward {
@@ -215,6 +217,7 @@ impl Forward {
             status: None,
             failure: None,
             over: false,
+            admitted: None,
         }
     }
 
@@ -504,6 +507,14 @@ impl Forward {
             return Err(ErrorClass::NoEndpoint);
         };
         if let Some(p) = rt.pools.get(self.pool) {
+            if let Some(limit) = p.adaptive.as_ref().and_then(|a| a.get(id.index())) {
+                // Past the adaptive limit: refused at once, neutral for the
+                // endpoint's health.
+                if !limit.try_acquire() {
+                    return Err(ErrorClass::Breaker);
+                }
+                self.admitted = Some((id, Instant::now()));
+            }
             p.balancer.started(id);
             self.balanced = Some(id);
         }
@@ -826,6 +837,17 @@ impl Forward {
 
     /// Ends the balancer's count for the current attempt.
     fn unbalance(&mut self) {
+        if let Some((id, at)) = self.admitted.take() {
+            if let Some(limit) = self
+                .rt
+                .pools
+                .get(self.pool)
+                .and_then(|p| p.adaptive.as_ref())
+                .and_then(|a| a.get(id.index()))
+            {
+                limit.release(u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            }
+        }
         if let (Some(id), Some(p)) = (self.balanced.take(), self.rt.pools.get(self.pool)) {
             let latency = self.sent_at.saturating_duration_since(self.started);
             p.balancer

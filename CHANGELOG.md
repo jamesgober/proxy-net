@@ -13,6 +13,69 @@
 
 ---
 
+## [0.7.0] - 2026-11-20
+
+Hardening: an attack test for every threat, several proxies at once, the
+upstream bytes checked against a second parser, 24-hour fuzzing and soaks,
+and the memory an exchange holds.
+
+### Added
+
+- `tests/attacks_suite.rs`: attack tests over sockets for host routing
+  (T-8), SSRF through routing (T-9), pool poisoning (T-12), memory
+  exhaustion (T-16), topology leaks (T-18), interception (T-19), trailer
+  injection (T-21), and cache poisoning (T-22). Every threat in the model now
+  has a named test (see `docs/SECURITY.md`).
+- `tests/multi_node.rs`: a chain of two proxies, a loop between them (508),
+  and an edge that keeps serving when one of two inner proxies stops.
+- Differential checking: the bytes the forwarder writes upstream are read by
+  http-net and by an independent strict reader, for 20,000 generated
+  requests in `tests/differential.rs` and in a new `differential` fuzz
+  target; both must accept them and agree on everything.
+- `tests/memory.rs`: heap per active exchange, 27.3 KiB by default and
+  15.3 KiB with 4 KiB client reads.
+- `Inbound::read_buffer`: the client connection's read buffer (16 KiB by
+  default).
+- `PoolLimits::adaptive_concurrency` (experimental, off by default): an
+  adaptive concurrency limit per endpoint that answers 503 before the
+  endpoint starts queueing; `EndpointHealth::adaptive_limit` reports it.
+- `benches/soak.rs`: a soak with mixed traffic, a flapping origin, live
+  endpoint changes and reloads, checked every minute and at the end.
+- `benches/compare.rs knee`: the adaptive limit swept over sockets against
+  an origin with a knee.
+- `docs/SECURITY.md`: the threat model, every threat with its defence, its
+  test, and its cost, the settings that matter, and the hardening record.
+
+### Fixed
+
+- A client's `Host` could add an element to `Forwarded`: a host name may
+  hold `,`, `;`, and `=`, and it was written without quotes, so
+  `Host: x,proto=https` reached the upstream as a second element of the
+  client's making. An empty host gave a value that did not parse. The host
+  is now quoted unless it is a token, in the proxy's own element and in
+  elements kept from trusted proxies. Found by the 24-hour `forwarded_append`
+  fuzz run.
+- A trusted `Forwarded` or `X-Forwarded-For` chain already at 16 entries
+  became 17 with this hop in append mode, which parse-net's default limits
+  refuse. A kept chain now leaves room for this hop, keeping its first entry
+  and the most recent ones.
+- The differential oracle counted every `Expect` field as removed; only
+  `Expect: 100-continue` is.
+
+### Changed
+
+- serve-net 0.8.3, which fixes WebSocket messages that could wait for the
+  next ping when the client was sending at the same time. The two pipelined
+  bridge tests, ignored in 0.6, run again.
+- The load generator in `benches/compare.rs` reads any status, so refusals
+  are counted without closing the connection.
+
+### Known gaps
+
+- The reactor path waits for serve-net and net-io (see the roadmap).
+
+---
+
 ## [0.6.0] - 2026-11-19
 
 Optimisation: the request path measured against other proxies and made
@@ -267,7 +330,8 @@ The scaffold and the plan. No functional code yet.
 - `dev/PLAN.md` (purpose, scope, architecture, threats, ecosystem, open
   decisions, decision log), `dev/DIRECTIVES.md`, and `dev/ROADMAP.md`.
 
-[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/proxy-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/proxy-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/proxy-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/proxy-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/proxy-net/compare/v0.3.0...v0.4.0

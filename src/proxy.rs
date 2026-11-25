@@ -227,6 +227,11 @@ impl ProxyHandle {
                             idle,
                             latency_ns: p.balancer.latency(id),
                             ramp: p.balancer.ramp(id),
+                            adaptive_limit: p
+                                .adaptive
+                                .as_ref()
+                                .and_then(|a| a.get(i))
+                                .map(crate::core::adaptive::GradientLimit::limit),
                         }
                     })
                     .collect(),
@@ -339,4 +344,6 @@ pub struct EndpointHealth {
     pub latency_ns: u64,
     /// Its slow-start share, in percent (100 when it is not ramping).
     pub ramp: u32,
+    /// Its adaptive concurrency limit, when the pool has one (0.7).
+    pub adaptive_limit: Option<u32>,
 }

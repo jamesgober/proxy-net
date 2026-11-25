@@ -7,8 +7,9 @@
 //!
 //! ## Status
 //!
-//! `0.6.0`: every feature planned for 1.0 is in, `wss` upstreams included,
-//! and the request path is measured against other proxies (`docs/PERFORMANCE.md`).
+//! `0.7.0`: every feature planned for 1.0 is in, `wss` upstreams included;
+//! the request path is measured against other proxies (`docs/PERFORMANCE.md`)
+//! and every threat in the model has an attack test (`docs/SECURITY.md`).
 //! With the default features, `proxy_net::proxy`
 //! puts a listener in front of a set of servers in one line, and
 //! `ProxyBuilder::build` starts a `Proxy` from pools, routes, and health
