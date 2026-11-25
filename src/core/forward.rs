@@ -1064,6 +1064,8 @@ mod tests {
 
     #[test]
     fn test_a_full_trusted_chain_still_parses_upstream() {
+        use alloc::format;
+        use alloc::string::{String, ToString};
         // A chain already at parse-net's limit of 16: keeping all of it and
         // adding this hop would make 17, which the same parser refuses.
         let c = config(one(Route::any()).forwarded(Forwarded::both().append_trusted()));
